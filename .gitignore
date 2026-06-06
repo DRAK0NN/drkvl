@@ -1,0 +1,11 @@
+references/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.eggs/
+*.pid
+tools/
+*.log
+.venv/
