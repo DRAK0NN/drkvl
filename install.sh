@@ -92,28 +92,33 @@ install_deps_pm() {
             ;;
         pacman)
             has unzip || pacman -S --noconfirm unzip
+            has ip    || pacman -S --noconfirm iproute2
             install_xray
             install_tun2socks
             ;;
         apt)
             has unzip || apt-get install -y unzip
             has curl  || apt-get install -y curl
+            has ip    || apt-get install -y iproute2
             install_xray
             install_tun2socks
             ;;
         dnf)
             has unzip || dnf install -y unzip
+            has ip    || dnf install -y iproute
             install_xray
             install_tun2socks
             ;;
         zypper)
             has unzip || zypper install -y unzip
+            has ip    || zypper install -y iproute2
             install_xray
             install_tun2socks
             ;;
         apk)
             has unzip || apk add unzip
             has curl  || apk add curl
+            has ip    || apk add iproute2
             install_xray
             install_tun2socks
             ;;
