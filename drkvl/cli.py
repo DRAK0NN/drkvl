@@ -115,8 +115,8 @@ def cmd_up(a) -> int:
     else:
         info("bypass disabled — all traffic via vpn")
 
-    info("generating xray config")
-    cfg = config.build(v, bypass=bypass)
+    info(f"generating xray config (direct fwmark {hex(tun.DIRECT_FWMARK)} -> table {tun.DIRECT_TABLE})")
+    cfg = config.build(v, bypass=bypass, direct_mark=tun.DIRECT_FWMARK)
     profile.ensure_dirs()
     config.dump(cfg, profile.XRAY_CONFIG)
     profile.chown_user(profile.XRAY_CONFIG)

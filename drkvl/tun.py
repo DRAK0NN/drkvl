@@ -14,6 +14,15 @@ TUN_NET = "10.10.0.0/16"
 RESOLV = Path("/etc/resolv.conf")
 DEFAULT_DNS = b"nameserver 1.1.1.1\nnameserver 8.8.8.8\n"
 
+# split-routing for the direct outbound: xray marks its bypass sockets
+# with DIRECT_FWMARK, an ip rule sends marked traffic to DIRECT_TABLE,
+# and that table holds the original gw default. avoids the drkvl0 loop
+# without relying on SO_BINDTODEVICE (which doesn't honour our prio-9
+# `from all lookup main` rule).
+DIRECT_FWMARK = 0xDD0DE
+DIRECT_TABLE = "100"
+DIRECT_RULE_PRIO = "8"
+
 # wireguard-quick style: force all output to consult `main` before any
 # other policy rule (mihomo's 9000+, custom vpn tables, etc.).
 # main holds our /32 pin for the vpn server and `default dev drkvl0`.
@@ -149,6 +158,54 @@ def _del_main_rule() -> None:
     _del_rule_prio(MAIN_RULE_PRIO)
 
 
+_MARK_RULES = [
+    # save xray's outbound mark into conntrack so reply packets can be
+    # restored on the way back in. nixos rpfilter (mangle PREROUTING,
+    # `fib ... validmark ...`) drops unmarked replies when their fib
+    # entry sits in our side table, hence we need the mark on the
+    # return path too.
+    ("OUTPUT", ["-m", "mark", "--mark", hex(DIRECT_FWMARK),
+                "-j", "CONNMARK", "--save-mark"]),
+    ("PREROUTING", ["-m", "connmark", "--mark", hex(DIRECT_FWMARK),
+                    "-j", "CONNMARK", "--restore-mark"]),
+]
+
+
+def _iptables_del_all(chain: str, args: list[str]) -> None:
+    for _ in range(8):
+        rc, _, _ = _run(["iptables", "-w", "-t", "mangle", "-D", chain, *args])
+        if rc != 0:
+            break
+
+
+def _install_mark_rules() -> None:
+    for chain, args in _MARK_RULES:
+        _iptables_del_all(chain, args)
+        _run(["iptables", "-w", "-t", "mangle", "-A", chain, *args],
+             check=True)
+
+
+def _remove_mark_rules() -> None:
+    for chain, args in _MARK_RULES:
+        _iptables_del_all(chain, args)
+
+
+def _setup_direct_table(gw_addr: str, gw_dev: str) -> None:
+    _run(["ip", "route", "flush", "table", DIRECT_TABLE])
+    ip("route", "add", "default", "via", gw_addr, "dev", gw_dev,
+       "table", DIRECT_TABLE)
+    _del_rule_prio(DIRECT_RULE_PRIO)
+    ip("rule", "add", "fwmark", hex(DIRECT_FWMARK), "lookup", DIRECT_TABLE,
+       "priority", DIRECT_RULE_PRIO)
+    _install_mark_rules()
+
+
+def _teardown_direct_table() -> None:
+    _remove_mark_rules()
+    _del_rule_prio(DIRECT_RULE_PRIO)
+    _run(["ip", "route", "flush", "table", DIRECT_TABLE])
+
+
 def _dump_routing(tag: str) -> None:
     try:
         path = profile.HOME / f"routing.{tag}.txt"
@@ -232,6 +289,10 @@ def apply_up(server_ip: str, socks_port: int) -> dict:
     info(f"adding default via {DEV}")
     ip("route", "add", "default", "dev", DEV, "metric", "1")
 
+    info(f"setting up direct table {DIRECT_TABLE} via {gw_addr} dev {gw_dev} "
+         f"(fwmark {hex(DIRECT_FWMARK)} -> prio {DIRECT_RULE_PRIO})")
+    _setup_direct_table(gw_addr, gw_dev)
+
     # confirm the pin still holds after the default got swapped to tun;
     # if the kernel resolves the server via drkvl0 we'd have a loop.
     final_dev = _verify_pin(server_ip, gw_dev)
@@ -258,14 +319,15 @@ def apply_down(snap: Optional[dict]) -> None:
 
     _del_pin_rule()
     _del_main_rule()
+    _teardown_direct_table()
 
     ip("route", "del", "default", "dev", DEV, check=False)
     ip("link", "set", DEV, "down", check=False)
     ip("link", "del", DEV, check=False)
 
     if snap:
-        srv = snap.get("server_ip")
         gw = snap.get("default") or {}
+        srv = snap.get("server_ip")
         if srv:
             ip("route", "del", f"{srv}/32", check=False)
         if gw.get("gateway") and gw.get("dev"):

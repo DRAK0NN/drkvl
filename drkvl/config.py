@@ -98,7 +98,7 @@ def _stream(v: Vless) -> dict:
 
 def build(v: Vless, socks_port: int = SOCKS_PORT, api_port: int = API_PORT,
           bind_interface: str | None = None, mark: int = 0,
-          bypass: bool = True) -> dict:
+          bypass: bool = True, direct_mark: int = 0) -> dict:
     user = {"id": v.uuid, "encryption": v.encryption or "none"}
     if v.flow:
         user["flow"] = v.flow
@@ -114,6 +114,14 @@ def build(v: Vless, socks_port: int = SOCKS_PORT, api_port: int = API_PORT,
         sockopt["mark"] = mark
     if sockopt:
         proxy_stream["sockopt"] = sockopt
+
+    direct: dict = {"tag": "direct", "protocol": "freedom"}
+    if direct_mark:
+        # without this, direct-routed traffic (geosite:ru, geoip:ru) walks
+        # back into drkvl0 (the new default) and loops through tun2socks ->
+        # xray -> drkvl0 forever. mark sockets so a dedicated ip rule sends
+        # them to a side table whose default is the physical gw.
+        direct["streamSettings"] = {"sockopt": {"mark": direct_mark}}
 
     return {
         "log": {"loglevel": "warning"},
@@ -155,7 +163,7 @@ def build(v: Vless, socks_port: int = SOCKS_PORT, api_port: int = API_PORT,
                 },
                 "streamSettings": proxy_stream,
             },
-            {"tag": "direct", "protocol": "freedom"},
+            direct,
             {"tag": "block", "protocol": "blackhole"},
         ],
         "routing": _routing(bypass),
