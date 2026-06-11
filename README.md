@@ -1,113 +1,152 @@
-## drkvl
+# drkvl
 
-cli for managing a vless vpn on linux. tun mode only — all
-system traffic goes through the vpn.
+VLESS VPN client for Linux. TUN mode — all system traffic through VPN.
 
-routes the kernel through `tun2socks(8)` into an `xray` socks5
-inbound. supports xhttp + reality (incl. ml-dsa-65 / `pqv`).
+## screenshot
 
-### requires
+```
+ _____     _____     _    __  __      __   _
+|  __ \   |  __ \   | |  / /  \ \    / /  | |
+| |  | |  | |__) |  | | / /    \ \  / /   | |
+| |  | |  |  _  /   |  <        \ \/ /    | |
+| |__| |  | | \ \   | | \ \      \  /     | |____
+|_____/   |_|  \_\  |_|  \_\      \/      |______|
 
-- `xray` (https://github.com/XTLS/Xray-core)
-- `tun2socks` (https://github.com/xjasonlyu/tun2socks)
-- `iproute2` (`ip`)
-- python ≥ 3.9, stdlib only
+                    author: DRAK0NN
 
-### install
+          v0.2.1  |  2 profiles  |  vpn: off
 
-one-liner (any distro):
+  list, ls                     list profiles
+  add <url> [-n name]          add profile
+  up [name] [--no-bypass]      connect
+  down                         disconnect
+  status, st                   show status
+  stats                        show traffic
+  rm <name|index>              remove profile
+  default <name|index>         set default
+  emergency-off                hard stop + clean
+  help, ?                      this help
+  exit, q                      quit
+```
 
-    sudo bash <(curl -sL https://raw.githubusercontent.com/DRAK0NN/drkvl/main/install.sh)
+## features
 
-run from source:
+- VLESS + Reality + xhttp (post-quantum ML-DSA-65 supported)
+- full TUN routing via `tun2socks` + `xray` socks5
+- interactive TUI with tab completion
+- geo-bypass: RU sites/IPs go direct (geosite + geoip)
+- DNS over TCP through xray (no UDP leaks)
+- split routing with fwmark + connmark (NixOS rpfilter compatible)
 
-    git clone https://github.com/DRAK0NN/drkvl /opt/drkvl
-    python3 -m drkvl ...
+## requires
 
-### nixos
+| dep | version |
+|-----|---------|
+| xray | >= 26.5 (xhttp support) |
+| tun2socks | any |
+| iproute2 | any |
+| python | >= 3.9, stdlib only |
 
-`pip install` doesn't work on nixos (read-only nix store). use the
-install script or run from source. for deps:
+## install
 
-    nix-env -iA nixos.tun2socks
+### NixOS
 
-xray from nixos repos is often too old (no xhttp support). install
-v26+ manually:
+tun2socks from nixpkgs, xray manually (nixpkgs version too old for xhttp):
 
-    curl -sL https://github.com/XTLS/Xray-core/releases/download/v26.5.9/Xray-linux-64.zip -o /tmp/xray.zip
-    unzip /tmp/xray.zip xray -d ~/.local/bin && chmod +x ~/.local/bin/xray
+```sh
+nix-env -iA nixos.tun2socks
 
-make sure `~/.local/bin` is in your PATH (add to `~/.bashrc`):
+curl -sL https://github.com/XTLS/Xray-core/releases/download/v26.5.9/Xray-linux-64.zip -o /tmp/xray.zip
+unzip /tmp/xray.zip xray -d ~/.local/bin && chmod +x ~/.local/bin/xray
+export PATH="$HOME/.local/bin:$PATH"  # add to ~/.bashrc
+```
 
-    export PATH="$HOME/.local/bin:$PATH"
+### pip
 
-when running `sudo drkvl up`, pass the PATH:
+```sh
+pip install --user .
+```
 
-    sudo env PATH="$HOME/.local/bin:$PATH" python3 -m drkvl up
+### from source
 
-### use
+```sh
+chmod +x drkvl-run
+./drkvl-run
+```
 
-    drkvl add 'vless://...#name'
-    drkvl add 'vless://...' -n work
-    drkvl list
-    drkvl default work
-    drkvl rm work
-    drkvl status
-    drkvl stats
-    drkvl stats -f
+## usage
 
-    sudo drkvl up              # default profile
-    sudo drkvl up work         # named profile
-    sudo drkvl down
-    sudo drkvl emergency-off   # hard stop, clean tun, restore routes
+### interactive (TUI)
 
-`add`, `list`, `rm`, `default`, `status`, `stats` run as a normal
-user. `up`, `down` and `emergency-off` need root for `ip(8)`,
-`tun2socks(8)` and `/etc/resolv.conf`. drkvl honours `SUDO_USER`,
-so profiles stay under the invoking user's `~/.config/drkvl/`.
+```sh
+drkvl          # launches TUI if on a tty
+./drkvl-run    # same, from source
+```
 
-state lives in `~/.config/drkvl/`:
+### CLI
 
-    profiles/   parsed vless profiles
-    default     name of the default profile
-    active.json current session (pid, profile, start time)
-    backup_routes.json  original routes + resolv.conf
-    xray_config.json    generated xray config
+```sh
+drkvl add 'vless://uuid@host:443?type=xhttp&security=reality&...' -n myserver
+drkvl list
+drkvl default myserver
+drkvl status
+drkvl stats -f
+```
 
-### vless link
+`up`/`down`/`emergency-off` need root:
 
-supported query params:
+```sh
+sudo drkvl up              # connect default profile
+sudo drkvl up myserver     # connect named profile
+sudo drkvl up --no-bypass  # all traffic via VPN (no geo-bypass)
+sudo drkvl down
+sudo drkvl emergency-off   # hard cleanup
+```
 
-    type           tcp, ws, grpc, xhttp, httpupgrade
-    security       reality, tls, none
-    encryption     usually none
-    flow           e.g. xtls-rprx-vision
+drkvl honours `SUDO_USER` — profiles stay under the invoking user's `~/.config/drkvl/`.
 
-    path, mode, extra, host    xhttp / ws
-    serviceName, authority     grpc
+## vless link
 
-    sni, fp, alpn              tls
-    pbk, sid, spx, pqv         reality
+Supported `vless://` query params:
 
-fragment after `#` is the profile name.
+```
+type           tcp, ws, grpc, xhttp, httpupgrade
+security       reality, tls, none
+encryption     none
+flow           xtls-rprx-vision
 
-### caveats
+path, mode, extra, host    xhttp / ws
+serviceName, authority     grpc
 
-- single profile up at a time. ports `1080` (socks) and `10085`
-  (xray api) are fixed.
-- `10.10.0.0/16` is used for the tun interface (`drkvl0`).
-- dns is forced to `1.1.1.1` / `8.8.8.8` to prevent leaks; the
-  original `/etc/resolv.conf` is saved and restored on down.
-- if anything goes wrong: `drkvl emergency-off`.
+sni, fp, alpn              tls
+pbk, sid, spx, pqv         reality
+```
 
-### layout
+Fragment `#name` sets the profile name.
 
-    drkvl/
-      link.py     vless:// parser
-      config.py   xray json generator
-      profile.py  on-disk state
-      proc.py     xray / tun2socks lifecycle
-      tun.py      tun + routes + sudo prompt
-      stats.py    xray stats api
-      cli.py      argparse entry
-      util.py     misc
+## caveats
+
+- one connection at a time
+- ports `1080` (socks) and `10085` (xray api) are hardcoded
+- TUN interface `drkvl0` uses `10.10.0.0/16`
+- DNS forced to `1.1.1.1` / `8.8.8.8`; original resolv.conf restored on down
+- if anything breaks: `sudo drkvl emergency-off`
+
+## layout
+
+```
+drkvl/
+  cli.py        argparse entry + commands
+  tui.py        interactive TUI (readline, colors)
+  link.py       vless:// URI parser
+  config.py     xray JSON config generator
+  profile.py    on-disk state (~/.config/drkvl/)
+  proc.py       xray / tun2socks lifecycle
+  tun.py        TUN device + routing + iptables
+  stats.py      xray gRPC stats API
+  geo.py        geosite/geoip asset manager
+  clash.py      clash/mihomo conflict handler
+  util.py       misc helpers
+drkvl-run       standalone entry point
+pyproject.toml  package metadata
+```
