@@ -54,7 +54,7 @@ def _start(name: str, argv: list[str], pidfile: Path, log: Path,
         start_new_session=True,
         env=sub_env,
     )
-    time.sleep(0.3)
+    time.sleep(0.15)
     if p.poll() is not None:
         raise RuntimeError(f"{name} exited immediately (see {log})")
 
@@ -75,7 +75,7 @@ def start_tun2socks(device: str, socks_port: int, mtu: int = 1500) -> int:
                    "-device", f"tun://{device}",
                    "-proxy", f"socks5://127.0.0.1:{socks_port}",
                    "-mtu", str(mtu),
-                   "-loglevel", "warn"],
+                   "-loglevel", "warning"],
                   TUN2SOCKS_PID, TUN2SOCKS_LOG)
 
 

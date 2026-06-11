@@ -1,6 +1,5 @@
 import re
 import subprocess
-from typing import Optional
 
 from .util import have
 

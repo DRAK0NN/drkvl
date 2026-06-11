@@ -94,7 +94,8 @@ def save(v: Vless, name: Optional[str] = None) -> str:
         target = _path(f"{name}-{i}")
         i += 1
 
-    with open(target, "w") as f:
+    fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
         json.dump(v.to_dict(), f, indent=2)
 
     if not DEFAULT.exists():
@@ -153,9 +154,10 @@ def read_json(p: Path) -> Optional[dict]:
         return None
 
 
-def write_json(p: Path, data: dict) -> None:
+def write_json(p: Path, data: dict, mode: int = 0o644) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
-    with open(p, "w") as f:
+    fd = os.open(str(p), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w") as f:
         json.dump(data, f, indent=2)
     chown_user(p)
 

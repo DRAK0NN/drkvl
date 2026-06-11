@@ -306,8 +306,10 @@ def apply_up(server_ip: str, socks_port: int) -> dict:
     info("writing /etc/resolv.conf")
     _write_resolv(DEFAULT_DNS)
 
-    info("stopping systemd-resolved (avoid LLMNR flood)")
-    subprocess.run(["systemctl", "stop", "systemd-resolved"], check=False)
+    if subprocess.run(["systemctl", "is-active", "--quiet", "systemd-resolved"],
+                      capture_output=True).returncode == 0:
+        info("stopping systemd-resolved (avoid LLMNR flood)")
+        subprocess.run(["systemctl", "stop", "systemd-resolved"], check=False)
 
     _dump_routing("up_ok")
     return snap
@@ -335,8 +337,8 @@ def apply_down(snap: Optional[dict]) -> None:
             if not default_route():
                 ip("route", "add", "default", "via", gw["gateway"], "dev", gw["dev"], check=False)
 
-    info("starting systemd-resolved")
-    subprocess.run(["systemctl", "start", "systemd-resolved"], check=False)
+    subprocess.run(["systemctl", "start", "systemd-resolved"],
+                   capture_output=True, check=False)
 
     if profile.RESOLV_BAK.exists():
         try:

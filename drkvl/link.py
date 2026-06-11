@@ -1,6 +1,5 @@
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from urllib.parse import urlparse, parse_qs, unquote
-from typing import Optional
 
 
 @dataclass
@@ -55,6 +54,8 @@ def parse(uri: str) -> Vless:
         raise ValueError("missing host")
     if u.port is None:
         raise ValueError("missing port")
+    if u.port < 1 or u.port > 65535:
+        raise ValueError(f"port {u.port} out of range 1-65535")
 
     q = {k: v[0] for k, v in parse_qs(u.query, keep_blank_values=True).items()}
 

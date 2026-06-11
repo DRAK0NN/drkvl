@@ -116,7 +116,7 @@ def cmd_up(a) -> int:
         info("bypass disabled — all traffic via vpn")
 
     info(f"generating xray config (direct fwmark {hex(tun.DIRECT_FWMARK)} -> table {tun.DIRECT_TABLE})")
-    cfg = config.build(v, bypass=bypass, direct_mark=tun.DIRECT_FWMARK)
+    cfg = config.build(v, bypass=bypass, direct_mark=tun.DIRECT_FWMARK, mark=tun.DIRECT_FWMARK)
     profile.ensure_dirs()
     config.dump(cfg, profile.XRAY_CONFIG)
     profile.chown_user(profile.XRAY_CONFIG)
@@ -294,6 +294,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+
+    if not argv or argv == ["-i"]:
+        if sys.stdout.isatty():
+            from .tui import run
+            return run()
+        build_parser().print_help()
+        return 0
+
     p = build_parser()
     args = p.parse_args(argv)
     try:

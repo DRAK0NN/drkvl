@@ -13,23 +13,37 @@ inbound. supports xhttp + reality (incl. ml-dsa-65 / `pqv`).
 - `iproute2` (`ip`)
 - python ≥ 3.9, stdlib only
 
-on nixos:
-
-    nix-shell -p xray tun2socks
-
 ### install
 
-one-liner:
+one-liner (any distro):
 
     sudo bash <(curl -sL https://raw.githubusercontent.com/DRAK0NN/drkvl/main/install.sh)
 
-manual:
+run from source:
 
-    pip install --user .
+    git clone https://github.com/DRAK0NN/drkvl /opt/drkvl
+    python3 -m drkvl ...
 
-or run from source:
+### nixos
 
-    python -m drkvl ...
+`pip install` doesn't work on nixos (read-only nix store). use the
+install script or run from source. for deps:
+
+    nix-env -iA nixos.tun2socks
+
+xray from nixos repos is often too old (no xhttp support). install
+v26+ manually:
+
+    curl -sL https://github.com/XTLS/Xray-core/releases/download/v26.5.9/Xray-linux-64.zip -o /tmp/xray.zip
+    unzip /tmp/xray.zip xray -d ~/.local/bin && chmod +x ~/.local/bin/xray
+
+make sure `~/.local/bin` is in your PATH (add to `~/.bashrc`):
+
+    export PATH="$HOME/.local/bin:$PATH"
+
+when running `sudo drkvl up`, pass the PATH:
+
+    sudo env PATH="$HOME/.local/bin:$PATH" python3 -m drkvl up
 
 ### use
 

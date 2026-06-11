@@ -51,7 +51,7 @@ def c(code: str, s: str) -> str:
 
 
 def info(s: str) -> None:
-    print(f":: {s}")
+    print(f"{c('32', '::')} {s}")
 
 
 def warn(s: str) -> None:

@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Optional
 
 from . import profile
-from .util import info, warn
+from .util import info
 
 # v2fly publishes canonical geosite (`category-ru`, `category-cn`, etc.)
 # and geoip data. xray reads them as `geosite.dat` / `geoip.dat`.

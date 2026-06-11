@@ -125,6 +125,10 @@ def build(v: Vless, socks_port: int = SOCKS_PORT, api_port: int = API_PORT,
 
     return {
         "log": {"loglevel": "warning"},
+        "dns": {
+            "servers": ["tcp://1.1.1.1", "tcp://8.8.8.8"],
+            "queryStrategy": "UseIPv4",
+        },
         "stats": {},
         "api": {"tag": "api", "services": ["StatsService"]},
         "policy": {
@@ -165,6 +169,7 @@ def build(v: Vless, socks_port: int = SOCKS_PORT, api_port: int = API_PORT,
             },
             direct,
             {"tag": "block", "protocol": "blackhole"},
+            {"tag": "dns-out", "protocol": "dns"},
         ],
         "routing": _routing(bypass),
     }
@@ -173,6 +178,7 @@ def build(v: Vless, socks_port: int = SOCKS_PORT, api_port: int = API_PORT,
 def _routing(bypass: bool) -> dict:
     rules: list[dict] = [
         {"type": "field", "inboundTag": ["api-in"], "outboundTag": "api"},
+        {"type": "field", "inboundTag": ["socks-in"], "port": "53", "outboundTag": "dns-out"},
         {"type": "field", "port": "5355", "outboundTag": "block"},
         {"type": "field", "ip": ["fe80::/10"], "outboundTag": "block"},
         {"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"},
@@ -193,5 +199,7 @@ def _routing(bypass: bool) -> dict:
 
 
 def dump(cfg: dict, path) -> None:
-    with open(path, "w") as f:
+    import os
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
         json.dump(cfg, f, indent=2)
