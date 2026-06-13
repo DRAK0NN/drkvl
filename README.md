@@ -89,7 +89,6 @@ pip install --user .
 
 ```sh
 drkvl          # launches TUI if on a tty
-./drkvl-run    # same, from source
 ```
 
 ### CLI
