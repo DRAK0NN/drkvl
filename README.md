@@ -67,13 +67,6 @@ export PATH="$HOME/.local/bin:$PATH"  # add to ~/.bashrc
 pip install --user .
 ```
 
-### from source
-
-```sh
-chmod +x drkvl-run
-./drkvl-run
-```
-
 ## usage
 
 ### interactive (TUI)
