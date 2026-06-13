@@ -69,14 +69,24 @@ def start_xray(config_path: Path, asset_dir: Optional[Path] = None) -> int:
                   XRAY_PID, XRAY_LOG, env=env)
 
 
+def _t2s_argv(device: str, socks_port: int, mtu: int, level: str) -> list[str]:
+    return ["tun2socks",
+            "-device", f"tun://{device}",
+            "-proxy", f"socks5://127.0.0.1:{socks_port}",
+            "-mtu", str(mtu),
+            "-loglevel", level]
+
+
 def start_tun2socks(device: str, socks_port: int, mtu: int = 1500) -> int:
-    return _start("tun2socks",
-                  ["tun2socks",
-                   "-device", f"tun://{device}",
-                   "-proxy", f"socks5://127.0.0.1:{socks_port}",
-                   "-mtu", str(mtu),
-                   "-loglevel", "warning"],
-                  TUN2SOCKS_PID, TUN2SOCKS_LOG)
+    # tun2socks <2.5 wants "warn", >=2.5 wants "warning"
+    try:
+        return _start("tun2socks",
+                      _t2s_argv(device, socks_port, mtu, "warn"),
+                      TUN2SOCKS_PID, TUN2SOCKS_LOG)
+    except RuntimeError:
+        return _start("tun2socks",
+                      _t2s_argv(device, socks_port, mtu, "warning"),
+                      TUN2SOCKS_PID, TUN2SOCKS_LOG)
 
 
 def _stop(pidfile: Path) -> bool:

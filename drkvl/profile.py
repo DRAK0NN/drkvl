@@ -34,6 +34,7 @@ _safe = re.compile(r"[^a-zA-Z0-9._-]+")
 
 def _slug(s: str) -> str:
     s = _safe.sub("-", s.strip()).strip("-")
+    s = s.replace("..", "").strip("-.")
     return s.lower() or "profile"
 
 
