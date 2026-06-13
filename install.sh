@@ -35,6 +35,8 @@ detect_pm() {
     fi
 }
 
+BIN_DIR="/usr/local/bin"
+
 install_xray() {
     if has xray; then
         dim "xray already installed: $(xray version | head -1)"
@@ -45,9 +47,10 @@ install_xray() {
     local url="https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VER}/Xray-linux-${xray_arch}.zip"
     curl -sL "$url" -o "$tmp/xray.zip" || die "failed to download xray"
     unzip -qo "$tmp/xray.zip" xray -d "$tmp" || die "failed to extract xray"
-    install -m 755 "$tmp/xray" /usr/local/bin/xray
+    mkdir -p "$BIN_DIR"
+    install -m 755 "$tmp/xray" "$BIN_DIR/xray"
     rm -rf "$tmp"
-    green "xray installed to /usr/local/bin/xray"
+    green "xray installed to $BIN_DIR/xray"
 }
 
 install_tun2socks() {
@@ -60,9 +63,10 @@ install_tun2socks() {
     local url="https://github.com/xjasonlyu/tun2socks/releases/download/v${TUN2SOCKS_VER}/tun2socks-linux-${t2s_arch}.zip"
     curl -sL "$url" -o "$tmp/t2s.zip" || die "failed to download tun2socks"
     unzip -qo "$tmp/t2s.zip" tun2socks-linux-${t2s_arch} -d "$tmp" || die "failed to extract tun2socks"
-    install -m 755 "$tmp/tun2socks-linux-${t2s_arch}" /usr/local/bin/tun2socks
+    mkdir -p "$BIN_DIR"
+    install -m 755 "$tmp/tun2socks-linux-${t2s_arch}" "$BIN_DIR/tun2socks"
     rm -rf "$tmp"
-    green "tun2socks installed to /usr/local/bin/tun2socks"
+    green "tun2socks installed to $BIN_DIR/tun2socks"
 }
 
 install_tun2socks_nix() {
@@ -74,20 +78,11 @@ install_tun2socks_nix() {
     nix-env -iA nixpkgs.tun2socks 2>/dev/null || install_tun2socks
 }
 
-install_xray_nix() {
-    if has xray; then
-        dim "xray already installed"
-        return
-    fi
-    info "installing xray via nix"
-    nix-env -iA nixpkgs.xray 2>/dev/null || install_xray
-}
-
 install_deps_pm() {
     local pm="$1"
     case "$pm" in
         nix)
-            install_xray_nix
+            install_xray
             install_tun2socks_nix
             ;;
         pacman)
@@ -146,12 +141,13 @@ install_drkvl() {
         fi
     fi
 
-    cat > /usr/local/bin/drkvl << 'WRAPPER'
+    mkdir -p "$BIN_DIR"
+    cat > "$BIN_DIR/drkvl" << 'WRAPPER'
 #!/usr/bin/env bash
 cd /opt/drkvl && exec python3 -m drkvl "$@"
 WRAPPER
-    chmod 755 /usr/local/bin/drkvl
-    green "drkvl installed to /usr/local/bin/drkvl"
+    chmod 755 "$BIN_DIR/drkvl"
+    green "drkvl installed to $BIN_DIR/drkvl"
 }
 
 check_python() {
@@ -181,4 +177,4 @@ echo "    sudo drkvl down"
 echo
 dim "  xray:      $(xray version 2>/dev/null | head -1 || echo 'not found')"
 dim "  tun2socks: $(tun2socks -version 2>&1 | head -1 || echo 'installed')"
-dim "  drkvl:     /usr/local/bin/drkvl"
+dim "  drkvl:     $BIN_DIR/drkvl"
