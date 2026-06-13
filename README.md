@@ -49,22 +49,45 @@ VLESS VPN client for Linux. TUN mode — all system traffic through VPN.
 
 ## install
 
-### NixOS
-
-tun2socks from nixpkgs, xray manually (nixpkgs version too old for xhttp):
+### one-liner (any distro)
 
 ```sh
-nix-env -iA nixos.tun2socks
+sudo bash <(curl -sL https://raw.githubusercontent.com/DRAK0NN/drkvl/main/install.sh)
+```
 
+Installs xray, tun2socks, iproute2, and drkvl to `/usr/local/bin`.
+
+### NixOS
+
+nixpkgs xray is too old (no xhttp). Install deps + xray binary manually:
+
+```sh
+nix-env -iA nixpkgs.python3 nixpkgs.tun2socks nixpkgs.unzip nixpkgs.curl
+mkdir -p ~/.local/bin
 curl -sL https://github.com/XTLS/Xray-core/releases/download/v26.5.9/Xray-linux-64.zip -o /tmp/xray.zip
 unzip /tmp/xray.zip xray -d ~/.local/bin && chmod +x ~/.local/bin/xray
 export PATH="$HOME/.local/bin:$PATH"  # add to ~/.bashrc
+```
+
+Then clone and run:
+
+```sh
+sudo mkdir -p /opt
+sudo git clone https://github.com/DRAK0NN/drkvl /opt/drkvl
+cd /opt/drkvl && python3 -m drkvl
 ```
 
 ### pip
 
 ```sh
 pip install --user .
+```
+
+### from source
+
+```sh
+chmod +x drkvl-run
+./drkvl-run
 ```
 
 ## usage

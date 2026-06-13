@@ -86,34 +86,45 @@ install_deps_pm() {
             install_tun2socks_nix
             ;;
         pacman)
-            has unzip || pacman -S --noconfirm unzip
-            has ip    || pacman -S --noconfirm iproute2
+            has python3 || pacman -S --noconfirm python
+            has unzip   || pacman -S --noconfirm unzip
+            has ip      || pacman -S --noconfirm iproute2
+            has git     || pacman -S --noconfirm git
             install_xray
             install_tun2socks
             ;;
         apt)
-            has unzip || apt-get install -y unzip
-            has curl  || apt-get install -y curl
-            has ip    || apt-get install -y iproute2
+            apt-get update -qq
+            has python3 || apt-get install -y python3
+            has unzip   || apt-get install -y unzip
+            has curl    || apt-get install -y curl
+            has ip      || apt-get install -y iproute2
+            has git     || apt-get install -y git
             install_xray
             install_tun2socks
             ;;
         dnf)
-            has unzip || dnf install -y unzip
-            has ip    || dnf install -y iproute
+            has python3 || dnf install -y python3
+            has unzip   || dnf install -y unzip
+            has ip      || dnf install -y iproute
+            has git     || dnf install -y git
             install_xray
             install_tun2socks
             ;;
         zypper)
-            has unzip || zypper install -y unzip
-            has ip    || zypper install -y iproute2
+            has python3 || zypper install -y python3
+            has unzip   || zypper install -y unzip
+            has ip      || zypper install -y iproute2
+            has git     || zypper install -y git
             install_xray
             install_tun2socks
             ;;
         apk)
-            has unzip || apk add unzip
-            has curl  || apk add curl
-            has ip    || apk add iproute2
+            has python3 || apk add python3
+            has unzip   || apk add unzip
+            has curl    || apk add curl
+            has ip      || apk add iproute2
+            has git     || apk add git
             install_xray
             install_tun2socks
             ;;
@@ -161,8 +172,8 @@ check_python() {
 pm=$(detect_pm)
 info "detected package manager: $pm"
 
-check_python
 install_deps_pm "$pm"
+check_python
 install_drkvl
 
 has ip || die "iproute2 not found"
