@@ -83,13 +83,6 @@ cd /opt/drkvl && python3 -m drkvl
 pip install --user .
 ```
 
-### from source
-
-```sh
-chmod +x drkvl-run
-./drkvl-run
-```
-
 ## usage
 
 ### interactive (TUI)
