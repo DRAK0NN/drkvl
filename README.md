@@ -1,7 +1,7 @@
 # drkvl
-![License](https://img.shields.io/badge/license-GPL--3.0-f5c2e7)
-![Python](https://img.shields.io/badge/python-3.9+-89b4fa)
-![Platform](https://img.shields.io/badge/platform-linux-a6e3a1)
+![License](https://img.shields.io/badge/license-GPL--3.0-orange)
+![Python](https://img.shields.io/badge/python-3.9+-blue)
+![Platform](https://img.shields.io/badge/platform-linux-green)
 
 VLESS VPN client for Linux. TUN mode — all system traffic through VPN.
 
