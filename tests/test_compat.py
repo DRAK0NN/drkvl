@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from drkvl import link, config, profile
+from drkvl import link, config, profile, paths
 from drkvl.link import Vless
 
 
@@ -396,17 +396,17 @@ class TestLinkParser(unittest.TestCase):
 class TestProfileRoundtrip(unittest.TestCase):
     def setUp(self):
         self._tmpdir = tempfile.mkdtemp()
-        self._orig_home = profile.HOME
-        self._orig_profiles = profile.PROFILES
-        self._orig_default = profile.DEFAULT
-        profile.HOME = Path(self._tmpdir)
-        profile.PROFILES = profile.HOME / "profiles"
-        profile.DEFAULT = profile.HOME / "default"
+        self._orig_home = paths.HOME
+        self._orig_profiles = paths.PROFILES
+        self._orig_default = paths.DEFAULT
+        paths.HOME = Path(self._tmpdir)
+        paths.PROFILES = paths.HOME / "profiles"
+        paths.DEFAULT = paths.HOME / "default"
 
     def tearDown(self):
-        profile.HOME = self._orig_home
-        profile.PROFILES = self._orig_profiles
-        profile.DEFAULT = self._orig_default
+        paths.HOME = self._orig_home
+        paths.PROFILES = self._orig_profiles
+        paths.DEFAULT = self._orig_default
         import shutil
         shutil.rmtree(self._tmpdir, ignore_errors=True)
 
@@ -426,8 +426,8 @@ class TestProfileRoundtrip(unittest.TestCase):
     def test_save_sets_default(self):
         v = link.parse("vless://uid@h:443#first")
         name = profile.save(v)
-        self.assertTrue(profile.DEFAULT.exists())
-        self.assertEqual(profile.DEFAULT.read_text().strip(), name)
+        self.assertTrue(paths.DEFAULT.exists())
+        self.assertEqual(paths.DEFAULT.read_text().strip(), name)
 
     def test_list_all(self):
         for i in range(3):
@@ -451,7 +451,7 @@ class TestProfileRoundtrip(unittest.TestCase):
     def test_file_permissions(self):
         v = link.parse("vless://uid@h:443#perms")
         name = profile.save(v)
-        p = profile.PROFILES / f"{name}.json"
+        p = paths.PROFILES / f"{name}.json"
         mode = oct(os.stat(p).st_mode & 0o777)
         self.assertEqual(mode, "0o600")
 

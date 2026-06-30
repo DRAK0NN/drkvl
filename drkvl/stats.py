@@ -1,14 +1,16 @@
 import re
 import subprocess
 
+from . import config
 from .util import have
 
-API = "127.0.0.1:10085"
+API = f"127.0.0.1:{config.API_PORT}"
 
 _STAT_LINE = re.compile(r'"name":\s*"([^"]+)"\s*,\s*"value":\s*"?(-?\d+)"?')
 
 
 def query() -> dict[str, int]:
+    """Return xray's traffic counters as a name->bytes dict (empty if unavailable)."""
     if not have("xray"):
         return {}
     r = subprocess.run(
@@ -27,6 +29,7 @@ def query() -> dict[str, int]:
 
 
 def proxy_traffic() -> tuple[int, int]:
+    """Return ``(uplink, downlink)`` bytes for the proxy outbound."""
     s = query()
     up = s.get("outbound>>>proxy>>>traffic>>>uplink", 0)
     dn = s.get("outbound>>>proxy>>>traffic>>>downlink", 0)

@@ -31,6 +31,7 @@ def _is_active(unit: str) -> bool:
 
 
 def active_units() -> list[str]:
+    """Return the competing clash/mihomo systemd units that are currently active."""
     return [u for u in CANDIDATES if _is_active(u)]
 
 
@@ -48,6 +49,7 @@ def _clean_leftovers() -> None:
 
 
 def stop_active() -> list[str]:
+    """Stop competing proxy units, wipe their stale routing, and return what was stopped."""
     units = active_units()
     if not units:
         # still wipe stale rules in case the service was killed dirty.
@@ -62,6 +64,7 @@ def stop_active() -> list[str]:
 
 
 def start(units: Optional[list[str]]) -> None:
+    """Restart the proxy units previously stopped by :func:`stop_active`."""
     if not units:
         return
     for u in units:

@@ -1,4 +1,5 @@
 import json
+import os
 from .link import Vless
 
 SOCKS_PORT = 1080
@@ -97,17 +98,19 @@ def _stream(v: Vless) -> dict:
 
 
 def build(v: Vless, socks_port: int = SOCKS_PORT, api_port: int = API_PORT,
-          bind_interface: str | None = None, mark: int = 0,
-          bypass: bool = True, direct_mark: int = 0) -> dict:
+          mark: int = 0, bypass: bool = True, direct_mark: int = 0,
+          geo: bool = True) -> dict:
+    """Build the full xray config dict for ``v`` (socks inbound, routing, marks).
+
+    ``geo=False`` drops all geoip/geosite routing rules so the config needs no
+    .dat assets — used for throwaway speed-test xrays.
+    """
     user = {"id": v.uuid, "encryption": v.encryption or "none"}
     if v.flow:
         user["flow"] = v.flow
 
     proxy_stream = _stream(v)
     sockopt: dict = {}
-    if bind_interface:
-        # SO_BINDTODEVICE: pin the socket to a specific iface.
-        sockopt["interface"] = bind_interface
     if mark:
         # SO_MARK: paired with `ip rule fwmark <m> lookup main` so the
         # kernel ignores foreign policy routing (mihomo's table 2022 etc.).
@@ -171,18 +174,20 @@ def build(v: Vless, socks_port: int = SOCKS_PORT, api_port: int = API_PORT,
             {"tag": "block", "protocol": "blackhole"},
             {"tag": "dns-out", "protocol": "dns"},
         ],
-        "routing": _routing(bypass),
+        "routing": _routing(bypass, geo),
     }
 
 
-def _routing(bypass: bool) -> dict:
+def _routing(bypass: bool, geo: bool = True) -> dict:
     rules: list[dict] = [
         {"type": "field", "inboundTag": ["api-in"], "outboundTag": "api"},
         {"type": "field", "inboundTag": ["socks-in"], "port": "53", "outboundTag": "dns-out"},
         {"type": "field", "port": "5355", "outboundTag": "block"},
         {"type": "field", "ip": ["fe80::/10"], "outboundTag": "block"},
-        {"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"},
     ]
+    if geo:
+        # routing private/LAN traffic direct needs geoip.dat at parse time
+        rules.append({"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"})
     if bypass:
         rules += [
             {"type": "field", "domain": ["geosite:category-ru"], "outboundTag": "direct"},
@@ -198,8 +203,9 @@ def _routing(bypass: bool) -> dict:
     }
 
 
-def dump(cfg: dict, path) -> None:
-    import os
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+def dump(cfg: dict, path: "os.PathLike | str") -> None:
+    """Write ``cfg`` as JSON to ``path`` with mode 0600, refusing symlinks."""
+    fd = os.open(str(path),
+                 os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "w") as f:
         json.dump(cfg, f, indent=2)

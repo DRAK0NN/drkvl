@@ -1,11 +1,22 @@
 import json
+import os
+import socket
 import subprocess
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TypedDict
 
-from . import profile
-from .util import info, warn
+from . import ownership, paths, storage
+from .util import have, info, warn
+
+
+class Snapshot(TypedDict):
+    """Pre-``up`` routing and DNS state, captured so ``down`` can restore it."""
+    default: Optional[dict]
+    server_route: Optional[dict]
+    resolv: dict
+    stopped_resolved: bool
+    server_ip: str
 
 DEV = "drkvl0"
 TUN_ADDR = "10.10.0.1"
@@ -41,10 +52,12 @@ def _run(cmd: list[str], check: bool = False) -> tuple[int, str, str]:
 
 
 def ip(*args: str, check: bool = True) -> None:
+    """Run ``ip <args>``; raise RuntimeError on failure when ``check`` is true."""
     _run(["ip", *args], check=check)
 
 
 def default_route() -> Optional[dict]:
+    """Return the host's non-drkvl default route as a dict, or None if absent."""
     rc, out, _ = _run(["ip", "-j", "route", "show", "default"])
     if rc != 0:
         return None
@@ -59,6 +72,7 @@ def default_route() -> Optional[dict]:
 
 
 def route_to(addr: str) -> Optional[dict]:
+    """Return the route the kernel would use to reach ``addr``, or None."""
     rc, out, _ = _run(["ip", "-j", "route", "get", addr])
     if rc != 0:
         return None
@@ -69,45 +83,132 @@ def route_to(addr: str) -> Optional[dict]:
         return None
 
 
-def _backup_resolv() -> bool:
-    try:
-        data = RESOLV.read_bytes()
-    except OSError:
-        return False
-    try:
-        profile.HOME.mkdir(parents=True, exist_ok=True)
-        profile.RESOLV_BAK.write_bytes(data)
-        profile.chown_user(profile.RESOLV_BAK)
-        return True
-    except OSError:
-        return False
+def _write_bytes(path: Path, data: bytes) -> None:
+    # drop any symlink (nixos /etc/resolv.conf points into the read-only nix
+    # store) and write a real file, refusing to follow a planted symlink.
+    if path.is_symlink():
+        path.unlink()
+    fd = os.open(str(path),
+                 os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
 
 
 def _write_resolv(data: bytes) -> None:
-    # on nixos /etc/resolv.conf is a symlink into the read-only nix
-    # store. drop the symlink and write a real file in its place.
-    if RESOLV.is_symlink():
-        RESOLV.unlink()
-    RESOLV.write_bytes(data)
+    _write_bytes(RESOLV, data)
 
 
-def snapshot(server_ip: str) -> dict:
-    have_resolv = _backup_resolv()
-    snap = {
+def _backup_resolv() -> dict:
+    """Capture how to restore /etc/resolv.conf later.
+
+    Records the symlink target (so a nixos symlink survives), or copies the
+    real file to RESOLV_BAK. Never overwrites an existing backup and never
+    backs up our own placeholder, so a re-up after an unclean teardown can't
+    clobber the genuine config.
+    """
+    try:
+        if RESOLV.is_symlink():
+            return {"kind": "symlink", "target": os.readlink(RESOLV)}
+        data = RESOLV.read_bytes()
+    except OSError:
+        return {"kind": "none"}
+    if data == DEFAULT_DNS:
+        return {"kind": "none"}            # our own placeholder, not real config
+    if paths.RESOLV_BAK.exists():
+        return {"kind": "file"}            # keep the first genuine backup
+    try:
+        paths.HOME.mkdir(parents=True, exist_ok=True)
+        _write_bytes(paths.RESOLV_BAK, data)
+        ownership.chown_user(paths.RESOLV_BAK)
+        return {"kind": "file"}
+    except OSError:
+        return {"kind": "none"}
+
+
+def _restore_resolv(meta: Optional[dict]) -> None:
+    meta = meta or {}
+    kind = meta.get("kind")
+    try:
+        if kind == "symlink":
+            if RESOLV.is_symlink() or RESOLV.exists():
+                RESOLV.unlink()
+            os.symlink(meta["target"], RESOLV)
+        elif kind == "file" and paths.RESOLV_BAK.exists():
+            _write_bytes(RESOLV, paths.RESOLV_BAK.read_bytes())
+    except OSError as e:
+        warn(f"could not restore /etc/resolv.conf: {e}")
+
+
+def _check_server_ip(ip: str) -> None:
+    # defence in depth: server_ip is fed to `ip route`/`ip rule`; make sure it
+    # is a plain IPv4 literal and can't be an option-like string ('-x', ...).
+    try:
+        socket.inet_aton(ip)
+    except OSError:
+        raise RuntimeError(f"refusing to route to non-IPv4 server address {ip!r}")
+
+
+# --- IPv6: tun2socks is v4-only, so native IPv6 would bypass the tunnel.
+#     Block all v6 egress (except loopback) for the session and undo on down.
+_IP6_DROP = [
+    ("OUTPUT", ["-o", "lo", "-j", "ACCEPT"]),
+    ("OUTPUT", ["!", "-o", "lo", "-j", "DROP"]),
+]
+
+
+def _ip6t_del_all(chain: str, args: list[str]) -> None:
+    for _ in range(8):
+        rc, _, _ = _run(["ip6tables", "-w", "-D", chain, *args])
+        if rc != 0:
+            break
+
+
+def block_ipv6() -> None:
+    """Drop all non-loopback IPv6 egress for the session (ip6tables, or sysctl)."""
+    if have("ip6tables"):
+        for chain, a in _IP6_DROP:
+            _ip6t_del_all(chain, a)
+            _run(["ip6tables", "-w", "-A", chain, *a])
+    else:
+        # no ip6tables: disable the v6 stack outright for the session
+        _run(["sysctl", "-w", "net.ipv6.conf.all.disable_ipv6=1"])
+        _run(["sysctl", "-w", "net.ipv6.conf.default.disable_ipv6=1"])
+
+
+def unblock_ipv6() -> None:
+    """Undo :func:`block_ipv6`, restoring normal IPv6 egress."""
+    for chain, a in _IP6_DROP:
+        _ip6t_del_all(chain, a)
+    _run(["sysctl", "-w", "net.ipv6.conf.all.disable_ipv6=0"])
+    _run(["sysctl", "-w", "net.ipv6.conf.default.disable_ipv6=0"])
+
+
+def _resolved_active() -> bool:
+    return subprocess.run(
+        ["systemctl", "is-active", "--quiet", "systemd-resolved"],
+        capture_output=True).returncode == 0
+
+
+def snapshot(server_ip: str) -> Snapshot:
+    """Capture and persist the current routing/DNS state before bringing up the tun."""
+    snap: Snapshot = {
         "default": default_route(),
         "server_route": route_to(server_ip),
-        "resolv_backed_up": have_resolv,
+        "resolv": _backup_resolv(),
+        "stopped_resolved": False,
         "server_ip": server_ip,
     }
-    profile.write_json(profile.BACKUP, snap)
+    storage.write_json(paths.BACKUP, snap)
     return snap
 
 
-def load_snapshot() -> Optional[dict]:
-    return profile.read_json(profile.BACKUP)
+def load_snapshot() -> Optional[Snapshot]:
+    """Return the persisted pre-up snapshot, or None if there is none."""
+    return storage.read_json(paths.BACKUP)
 
 
 def dev_exists() -> bool:
+    """Return whether the drkvl0 tun device currently exists."""
     rc, _, _ = _run(["ip", "link", "show", DEV])
     return rc == 0
 
@@ -120,17 +221,6 @@ def _del_all_default_routes() -> int:
             break
         n += 1
     return n
-
-
-def _route_get(addr: str) -> Optional[dict]:
-    rc, out, _ = _run(["ip", "-j", "route", "get", addr])
-    if rc != 0:
-        return None
-    try:
-        items = json.loads(out)
-        return items[0] if items else None
-    except (json.JSONDecodeError, IndexError):
-        return None
 
 
 def _del_rule_prio(prio: str) -> None:
@@ -208,23 +298,25 @@ def _teardown_direct_table() -> None:
 
 def _dump_routing(tag: str) -> None:
     try:
-        path = profile.HOME / f"routing.{tag}.txt"
-        with open(path, "w") as f:
+        path = paths.HOME / f"routing.{tag}.txt"
+        fd = os.open(str(path),
+                     os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as f:
             for cmd in (["ip", "rule", "show"],
                         ["ip", "route", "show", "table", "all"]):
                 f.write(f"# {' '.join(cmd)}\n")
                 r = subprocess.run(cmd, capture_output=True, text=True)
                 f.write(r.stdout)
                 f.write("\n")
-        profile.chown_user(path)
+        ownership.chown_user(path)
     except OSError:
         pass
 
 
-def _verify_pin(server_ip: str, expect_dev: str) -> Optional[str]:
+def _verify_pin(server_ip: str) -> Optional[str]:
     """Return the dev that the kernel will actually use for server_ip,
     or None on lookup failure."""
-    r = _route_get(server_ip)
+    r = route_to(server_ip)
     if not r:
         return None
     return r.get("dev")
@@ -239,10 +331,13 @@ def _wait_dev(timeout: float = 3.0) -> None:
     raise RuntimeError(f"{DEV} did not appear after {timeout}s")
 
 
-def apply_up(server_ip: str, socks_port: int) -> dict:
+def apply_up(server_ip: str, socks_port: int) -> Snapshot:
+    """Bring up the tun: pin the server route, swap the default to drkvl0,
+    block IPv6, point DNS at the tunnel, and return the saved snapshot."""
     if dev_exists():
         raise RuntimeError(f"{DEV} already exists. run 'drkvl emergency-off' first")
 
+    _check_server_ip(server_ip)
     snap = snapshot(server_ip)
     gw = snap.get("default") or {}
     gw_addr = gw.get("gateway")
@@ -269,17 +364,17 @@ def apply_up(server_ip: str, socks_port: int) -> dict:
     ip("route", "replace", f"{server_ip}/32", "via", gw_addr, "dev", gw_dev,
        "table", "main")
 
-    dev = _verify_pin(server_ip, gw_dev)
+    dev = _verify_pin(server_ip)
     if dev != gw_dev:
         warn(f"pinned route resolves via {dev!r}, expected {gw_dev!r}; "
              f"adding ip rule (policy routing likely overrides main table)")
         _add_pin_rule(server_ip)
-        dev = _verify_pin(server_ip, gw_dev)
+        dev = _verify_pin(server_ip)
         if dev != gw_dev:
             _dump_routing("pin_failed")
             raise RuntimeError(
                 f"can't pin route to {server_ip}: still resolves via {dev!r}. "
-                f"see {profile.HOME}/routing.pin_failed.txt, then `ip rule show` "
+                f"see {paths.HOME}/routing.pin_failed.txt, then `ip rule show` "
                 f"and `ip route show table all`"
             )
 
@@ -295,30 +390,37 @@ def apply_up(server_ip: str, socks_port: int) -> dict:
 
     # confirm the pin still holds after the default got swapped to tun;
     # if the kernel resolves the server via drkvl0 we'd have a loop.
-    final_dev = _verify_pin(server_ip, gw_dev)
+    final_dev = _verify_pin(server_ip)
     if final_dev != gw_dev:
         _dump_routing("pin_lost")
         raise RuntimeError(
             f"pinned route lost after default swap: now via {final_dev!r}. "
-            f"see {profile.HOME}/routing.pin_lost.txt"
+            f"see {paths.HOME}/routing.pin_lost.txt"
         )
+
+    # tun2socks is IPv4-only; block native IPv6 egress so it can't leak.
+    info("blocking IPv6 egress (tun2socks is IPv4-only)")
+    block_ipv6()
 
     info("writing /etc/resolv.conf")
     _write_resolv(DEFAULT_DNS)
 
-    if subprocess.run(["systemctl", "is-active", "--quiet", "systemd-resolved"],
-                      capture_output=True).returncode == 0:
+    if _resolved_active():
         info("stopping systemd-resolved (avoid LLMNR flood)")
         subprocess.run(["systemctl", "stop", "systemd-resolved"], check=False)
+        snap["stopped_resolved"] = True
+        storage.write_json(paths.BACKUP, snap)
 
     _dump_routing("up_ok")
     return snap
 
 
-def apply_down(snap: Optional[dict]) -> None:
+def apply_down(snap: Optional[Snapshot]) -> None:
+    """Reverse :func:`apply_up`, restoring routes, IPv6, DNS and resolv.conf."""
     from . import proc
     proc.stop_tun2socks()
 
+    unblock_ipv6()
     _del_pin_rule()
     _del_main_rule()
     _teardown_direct_table()
@@ -337,24 +439,26 @@ def apply_down(snap: Optional[dict]) -> None:
             if not default_route():
                 ip("route", "add", "default", "via", gw["gateway"], "dev", gw["dev"], check=False)
 
-    subprocess.run(["systemctl", "start", "systemd-resolved"],
-                   capture_output=True, check=False)
+    # only restart systemd-resolved if WE stopped it (don't start a service
+    # the user had disabled/masked before `up`).
+    if snap and snap.get("stopped_resolved"):
+        r = subprocess.run(["systemctl", "start", "systemd-resolved"],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            warn(f"could not restart systemd-resolved: {r.stderr.strip()}")
 
-    if profile.RESOLV_BAK.exists():
-        try:
-            _write_resolv(profile.RESOLV_BAK.read_bytes())
-        except OSError as e:
-            warn(f"could not restore /etc/resolv.conf: {e}")
+    _restore_resolv((snap or {}).get("resolv"))
 
 
 def emergency() -> None:
+    """Best-effort hard cleanup of processes, tun, routes and DNS after a crash."""
     from . import proc
 
     xr = proc.xray_running()
     t2 = proc.tun2socks_running()
     dev = dev_exists()
     snap = load_snapshot()
-    bak = profile.RESOLV_BAK.exists()
+    bak = paths.RESOLV_BAK.exists()
 
     if not (xr or t2 or dev or snap or bak):
         info("nothing to clean up")
@@ -376,8 +480,9 @@ def emergency() -> None:
         except Exception as e:
             warn(f"teardown step failed: {e}")
 
-    profile.clear(proc.TUN2SOCKS_PID)
-    profile.clear(profile.ACTIVE)
-    profile.clear(profile.BACKUP)
-    profile.clear(profile.RESOLV_BAK)
+    storage.clear(proc.XRAY_PID)
+    storage.clear(proc.TUN2SOCKS_PID)
+    storage.clear(paths.ACTIVE)
+    storage.clear(paths.BACKUP)
+    storage.clear(paths.RESOLV_BAK)
     info("done")

@@ -4,6 +4,8 @@ from urllib.parse import urlparse, parse_qs, unquote
 
 @dataclass
 class Vless:
+    """A parsed vless:// link: identity, transport, security and their params."""
+
     uuid: str
     host: str
     port: int
@@ -35,14 +37,17 @@ class Vless:
     raw: str = ""
 
     def to_dict(self) -> dict:
+        """Return this link as a plain dict for JSON persistence."""
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict) -> "Vless":
+        """Build a Vless from a dict, ignoring unknown keys."""
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
 
 def parse(uri: str) -> Vless:
+    """Parse a ``vless://`` URI into a :class:`Vless`; raise ValueError if malformed."""
     s = uri.strip()
     if not s.startswith("vless://"):
         raise ValueError("not a vless link")
@@ -52,24 +57,34 @@ def parse(uri: str) -> Vless:
         raise ValueError("missing uuid")
     if not u.hostname:
         raise ValueError("missing host")
-    if u.port is None:
+    # urlparse defers port parsing until .port is accessed; a non-numeric
+    # port raises urllib's own ValueError there. Translate it into our own
+    # message so the user sees guidance, not "Port could not be cast ...".
+    try:
+        port = u.port
+    except ValueError:
+        raise ValueError("invalid port (must be a number between 1 and 65535)")
+    if port is None:
         raise ValueError("missing port")
-    if u.port < 1 or u.port > 65535:
-        raise ValueError(f"port {u.port} out of range 1-65535")
+    if port < 1 or port > 65535:
+        raise ValueError(f"port {port} out of range 1-65535")
 
     q = {k: v[0] for k, v in parse_qs(u.query, keep_blank_values=True).items()}
 
-    def g(k, d=""):
-        return unquote(q.get(k, d)) if q.get(k) is not None else d
+    # parse_qs already percent-decodes values; do NOT unquote a second time.
+    def g(k: str, d: str = "") -> str:
+        """Return query param ``k`` (already decoded), or default ``d``."""
+        val = q.get(k)
+        return val if val is not None else d
 
-    net = g("type", "tcp")
+    net = g("type", "tcp") or "tcp"
     if net == "raw":
         net = "tcp"
 
     v = Vless(
         uuid=unquote(u.username),
         host=u.hostname,
-        port=u.port,
+        port=port,
         name=unquote(u.fragment) if u.fragment else "",
         network=net,
         security=g("security", "none") or "none",

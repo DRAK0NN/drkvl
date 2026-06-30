@@ -2,10 +2,10 @@ import argparse
 import os
 import sys
 import time
-from datetime import datetime
 
-from . import clash, config, geo, link, profile, proc, stats, tun
-from .util import fmt_bytes, fmt_duration, info, warn, err, resolve_host, port_open
+from . import (clash, config, display, geo, link, ownership, paths, proc,
+               speed, state, stats, storage, sub, tun)
+from .util import fmt_bytes, have, info, warn, err, resolve_host, port_open
 
 
 def _require_root() -> bool:
@@ -15,34 +15,46 @@ def _require_root() -> bool:
     return True
 
 
+def _await_socks(port: int, attempts: int = 30, delay: float = 0.1) -> bool:
+    # proc._start only polls once after 0.15s; confirm xray actually bound the
+    # socks port (and is still alive) before we hand traffic to the tunnel,
+    # else we'd report a false 'up' while everything blackholes.
+    for _ in range(attempts):
+        if port_open(port):
+            return True
+        if not proc.xray_running():
+            return False
+        time.sleep(delay)
+    return False
+
+
 def cmd_add(a) -> int:
+    """Parse a vless:// URI and save it as a profile."""
     try:
         v = link.parse(a.uri)
     except ValueError as e:
         err(str(e))
         return 1
-    name = profile.save(v, a.name)
+    name = storage.save(v, a.name)
     info(f"saved profile '{name}' ({v.host}:{v.port}, {v.network}/{v.security})")
     return 0
 
 
 def cmd_list(a) -> int:
-    items = profile.list_all()
-    if not items:
+    """Print all saved profiles."""
+    lines = display.list_lines()
+    if not lines:
         info("no profiles")
         return 0
-    default = profile.DEFAULT.read_text().strip() if profile.DEFAULT.exists() else None
-    for i, (n, v) in enumerate(items):
-        mark = "*" if n == default else " "
-        tag = v.name if v.name else ""
-        sec = v.security or "none"
-        print(f"{mark} {i}  {n:<24} {v.host}:{v.port}  {v.network}/{sec}  {tag}")
+    for line in lines:
+        print(line)
     return 0
 
 
 def cmd_rm(a) -> int:
+    """Remove the profile named or indexed by ``a.target``."""
     try:
-        n = profile.remove(a.target)
+        n = storage.remove(a.target)
     except (FileNotFoundError, IndexError) as e:
         err(str(e))
         return 1
@@ -51,8 +63,9 @@ def cmd_rm(a) -> int:
 
 
 def cmd_default(a) -> int:
+    """Set the default profile to ``a.target``."""
     try:
-        profile.set_default(a.target)
+        state.set_default(a.target)
     except (FileNotFoundError, IndexError) as e:
         err(str(e))
         return 1
@@ -60,8 +73,69 @@ def cmd_default(a) -> int:
     return 0
 
 
+def cmd_sub(a) -> int:
+    """Download a subscription, add its vless profiles, and remember the URL."""
+    try:
+        body = sub.fetch(a.url)
+    except RuntimeError as e:
+        err(str(e))
+        return 1
+    vlesses, skipped = sub.parse_links(body)
+    if not vlesses:
+        err("no vless:// links found in subscription")
+        if skipped:
+            warn(f"{skipped} non-vless link(s) skipped")
+        return 1
+    sub.remove_names(sub.url_profiles(a.url))   # re-subscribing replaces the old set
+    names = sub.add_profiles(vlesses)
+    sub.set_url_profiles(a.url, names)
+    msg = f"added {len(names)} profile(s) from subscription"
+    if skipped:
+        msg += f" ({skipped} non-vless skipped)"
+    info(msg)
+    return 0
+
+
+def cmd_sub_update(a) -> int:
+    """Refresh subscriptions (all saved, or just ``a.url``), replacing each one's profiles.
+
+    Each subscription is fetched BEFORE its old profiles are removed, and only
+    that subscription's own profiles are touched, so a network blip on one never
+    deletes another's servers or corrupts the url->profiles map.
+    """
+    if a.url:
+        urls = [a.url]
+    else:
+        urls = sub.saved_urls()
+        if not urls:
+            err("no saved subscriptions; run 'drkvl sub <url>' first")
+            return 1
+
+    total = 0
+    for url in urls:
+        try:
+            body = sub.fetch(url)
+        except RuntimeError as e:
+            err(f"{url}: {e} (keeping existing profiles)")
+            continue
+        vlesses, skipped = sub.parse_links(body)
+        if not vlesses:
+            err(f"{url}: no vless links found (keeping existing profiles)")
+            continue
+        sub.remove_names(sub.url_profiles(url))   # only after a good fetch
+        names = sub.add_profiles(vlesses)
+        sub.set_url_profiles(url, names)
+        total += len(names)
+        line = f"{url}: {len(names)} profile(s)"
+        if skipped:
+            line += f" ({skipped} skipped)"
+        info(line)
+    info(f"updated {total} profile(s) from {len(urls)} subscription(s)")
+    return 0
+
+
 def _save_active(name: str, v: link.Vless, stopped_clash: list[str]) -> None:
-    profile.write_json(profile.ACTIVE, {
+    state.write_active({
         "name": name,
         "host": v.host,
         "port": v.port,
@@ -70,14 +144,56 @@ def _save_active(name: str, v: link.Vless, stopped_clash: list[str]) -> None:
     })
 
 
-def cmd_up(a) -> int:
-    if not _require_root():
-        return 1
+def _attempt(name: str, v: link.Vless, bypass: bool, asset_dir, socks_wait: int):
+    """Start xray for one profile and wait for its socks port to open.
 
+    Returns the resolved server IP on success, or None after warning and
+    stopping xray on failure (so the next fallback candidate can be tried).
+    """
     try:
-        name, v = profile.load(a.name)
-    except (FileNotFoundError, IndexError) as e:
-        err(str(e))
+        server_ip = resolve_host(v.host)
+    except RuntimeError as e:
+        warn(f"{name}: {e}")
+        return None
+    cfg = config.build(v, bypass=bypass, direct_mark=tun.DIRECT_FWMARK,
+                       mark=tun.DIRECT_FWMARK)
+    ownership.ensure_dirs()
+    config.dump(cfg, paths.XRAY_CONFIG)
+    ownership.chown_user(paths.XRAY_CONFIG)
+    try:
+        proc.start_xray(paths.XRAY_CONFIG, asset_dir=asset_dir)
+    except RuntimeError as e:
+        warn(f"{name}: xray failed to start ({e})")
+        return None
+    if not _await_socks(config.SOCKS_PORT, attempts=socks_wait, delay=0.1):
+        warn(f"{name}: socks port {config.SOCKS_PORT} did not open within "
+             f"{socks_wait // 10}s (see {proc.XRAY_LOG})")
+        proc.stop_xray()
+        return None
+    return server_ip
+
+
+def _select_working(candidates, attempt):
+    """Try each ``(name, vless)`` via ``attempt`` in order.
+
+    Return the first ``(name, vless, server_ip)`` whose attempt succeeds, or
+    None if none connect. Stops on the first success.
+    """
+    for name, v in candidates:
+        info(f"trying '{name}' ({v.host}:{v.port})")
+        server_ip = attempt(name, v)
+        if server_ip:
+            return name, v, server_ip
+    return None
+
+
+def cmd_up(a) -> int:
+    """Connect: start xray, bring up the tun, and route all traffic through the VPN.
+
+    With ``--fallback`` it speed-tests every saved profile in parallel and
+    connects to the fastest one that responded.
+    """
+    if not _require_root():
         return 1
 
     if proc.xray_running() or proc.tun2socks_running():
@@ -88,16 +204,45 @@ def cmd_up(a) -> int:
         err(f"port {config.SOCKS_PORT} already in use (lsof -i :{config.SOCKS_PORT})")
         return 1
 
-    info(f"loading profile '{name}'")
-    try:
-        server_ip = resolve_host(v.host)
-    except RuntimeError as e:
-        err(str(e))
-        return 1
+    if a.fallback:
+        profiles = storage.list_all()
+        if not profiles:
+            err("no profiles to try")
+            return 1
+        if not have("xray"):
+            err("xray not found in PATH")
+            return 1
+        info(f"speed-testing {len(profiles)} profile(s) in parallel...")
+        results = speed.run_tests(profiles)
+        for line in display.speed_table(results, color=sys.stdout.isatty()):
+            print(line)
+        responded = [r for r in results if r.status == "ok"]
+        if not responded:
+            err("no profile responded")
+            return 1
+        best = responded[0]
+        info(f"fastest: {best.name} ({best.latency_ms:.0f}ms) — connecting "
+             f"(falling back through {len(responded)} responder(s) if needed)")
+        # keep them in latency order so a connect failure falls back to the next
+        candidates = []
+        for r in responded:
+            try:
+                candidates.append(storage.load(r.name))
+            except (FileNotFoundError, IndexError):
+                pass
+        if not candidates:
+            err("no profile responded")
+            return 1
+    else:
+        try:
+            candidates = [storage.load(a.name)]
+        except (FileNotFoundError, IndexError) as e:
+            err(str(e))
+            return 1
+    socks_wait = 30    # 3s for the real connect (winner already proven reachable)
 
     gw = tun.default_route() or {}
-    gw_dev = gw.get("dev")
-    if not gw_dev:
+    if not gw.get("dev"):
         err("no default route on this host")
         return 1
 
@@ -115,18 +260,13 @@ def cmd_up(a) -> int:
     else:
         info("bypass disabled — all traffic via vpn")
 
-    info(f"generating xray config (direct fwmark {hex(tun.DIRECT_FWMARK)} -> table {tun.DIRECT_TABLE})")
-    cfg = config.build(v, bypass=bypass, direct_mark=tun.DIRECT_FWMARK, mark=tun.DIRECT_FWMARK)
-    profile.ensure_dirs()
-    config.dump(cfg, profile.XRAY_CONFIG)
-    profile.chown_user(profile.XRAY_CONFIG)
-
-    info(f"starting xray on socks5://127.0.0.1:{config.SOCKS_PORT}")
-    try:
-        proc.start_xray(profile.XRAY_CONFIG, asset_dir=asset_dir)
-    except RuntimeError as e:
-        err(str(e))
+    chosen = _select_working(
+        candidates,
+        lambda name, v: _attempt(name, v, bypass, asset_dir, socks_wait))
+    if not chosen:
+        err("no profile connected")
         return 1
+    name, v, server_ip = chosen
 
     stopped_clash = clash.stop_active()
 
@@ -138,17 +278,25 @@ def cmd_up(a) -> int:
         proc.stop_xray()
         try:
             tun.apply_down(tun.load_snapshot())
-        except Exception:
-            pass
+        except Exception as re:
+            err(f"rollback failed: {re}")
+            err("routing may be inconsistent — run 'sudo drkvl emergency-off'")
         clash.start(stopped_clash)
+        for f in (proc.TUN2SOCKS_PID, paths.ACTIVE, paths.BACKUP,
+                  paths.RESOLV_BAK):
+            storage.clear(f)
         return 1
 
     _save_active(name, v, stopped_clash)
     info(f"up: {name} ({v.host}:{v.port})")
+    # connection is already established; this socks-side IP check is bounded by
+    # curl --max-time so it can't hang or delay anything.
+    print(display.vpn_ip_line(config.SOCKS_PORT, color=sys.stdout.isatty()))
     return 0
 
 
 def cmd_down(a) -> int:
+    """Tear down the tunnel and restore the prior routing/DNS state."""
     if not (proc.xray_running() or proc.tun2socks_running() or tun.dev_exists()):
         info("not running")
         return 0
@@ -156,7 +304,7 @@ def cmd_down(a) -> int:
     if not _require_root():
         return 1
 
-    active = profile.read_json(profile.ACTIVE) or {}
+    active = state.read_active() or {}
     stopped_clash = active.get("stopped_clash") or []
 
     info("stopping xray")
@@ -172,21 +320,22 @@ def cmd_down(a) -> int:
 
     clash.start(stopped_clash)
 
-    profile.clear(proc.TUN2SOCKS_PID)
-    profile.clear(profile.ACTIVE)
-    profile.clear(profile.BACKUP)
-    profile.clear(profile.RESOLV_BAK)
+    storage.clear(proc.TUN2SOCKS_PID)
+    storage.clear(paths.ACTIVE)
+    storage.clear(paths.BACKUP)
+    storage.clear(paths.RESOLV_BAK)
     info("down")
     return 0
 
 
 def cmd_emergency(a) -> int:
+    """Hard-stop everything and clean up tun/routes/DNS, even after a crash."""
     xr = proc.xray_running()
     t2 = proc.tun2socks_running()
     dev = tun.dev_exists()
     snap = tun.load_snapshot()
-    bak = profile.RESOLV_BAK.exists()
-    active = profile.read_json(profile.ACTIVE) or {}
+    bak = paths.RESOLV_BAK.exists()
+    active = state.read_active() or {}
     stopped_clash = active.get("stopped_clash") or []
 
     if not (xr or t2 or dev or snap or bak or stopped_clash):
@@ -202,30 +351,22 @@ def cmd_emergency(a) -> int:
 
 
 def cmd_status(a) -> int:
-    active = profile.read_json(profile.ACTIVE)
-    xr = proc.xray_running()
-    t2 = proc.tun2socks_running()
-    state = "on" if (xr and t2) else ("partial" if (xr or t2) else "off")
-    print(f"state:     {state}")
-    print(f"xray:      {'running' if xr else 'stopped'}")
-    print(f"tun2socks: {'running' if t2 else 'stopped'}")
-    if active:
-        up = time.time() - active.get("started", time.time())
-        print(f"profile:   {active.get('name')}")
-        print(f"server:    {active.get('host')}:{active.get('port')}")
-        print(f"uptime:    {fmt_duration(up)}")
-        print(f"started:   {datetime.fromtimestamp(active['started']).isoformat(timespec='seconds')}")
+    """Print connection state and the active session, if any."""
+    for line in display.status_lines():
+        print(line)
     return 0
 
 
 def cmd_stats(a) -> int:
+    """Print proxy traffic counters, optionally refreshing with ``--follow``."""
     if not proc.xray_running():
         err("xray not running")
         return 1
 
     def once(prev=None):
+        """Sample traffic once, returning ``(up, dn, line)`` with optional rate."""
         up, dn = stats.proxy_traffic()
-        line = f"↑ {fmt_bytes(up):>8}    ↓ {fmt_bytes(dn):>8}"
+        line = display.stats_line(up, dn)
         if prev:
             du = up - prev[0]
             dd = dn - prev[1]
@@ -250,50 +391,81 @@ def cmd_stats(a) -> int:
     return 0
 
 
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="drkvl", description="vless vpn client")
-    sub = p.add_subparsers(dest="cmd", required=True)
+def cmd_speedtest(a) -> int:
+    """Speed-test all profiles in parallel and print a latency table (no connection)."""
+    profiles = storage.list_all()
+    if not profiles:
+        err("no profiles")
+        return 1
+    if not have("xray"):
+        err("xray not found in PATH")
+        return 1
+    info(f"speed-testing {len(profiles)} profile(s)...")
+    results = speed.run_tests(profiles)
+    for line in display.speed_table(results, color=sys.stdout.isatty()):
+        print(line)
+    return 0
 
-    a = sub.add_parser("add", help="add profile from vless:// link")
+
+def build_parser() -> argparse.ArgumentParser:
+    """Construct the argparse parser for all drkvl subcommands."""
+    p = argparse.ArgumentParser(prog="drkvl", description="vless vpn client")
+    sp = p.add_subparsers(dest="cmd", required=True)
+
+    a = sp.add_parser("add", help="add profile from vless:// link")
     a.add_argument("uri")
     a.add_argument("-n", "--name", help="profile name")
     a.set_defaults(fn=cmd_add)
 
-    a = sub.add_parser("list", help="list profiles")
-    a.set_defaults(fn=cmd_list)
-    sub.add_parser("ls", help="alias for list").set_defaults(fn=cmd_list)
+    a = sp.add_parser("sub", help="add a subscription (base64 list of vless links)")
+    a.add_argument("url")
+    a.set_defaults(fn=cmd_sub)
 
-    a = sub.add_parser("rm", help="remove profile")
+    a = sp.add_parser("sub-update", help="refresh saved subscriptions")
+    a.add_argument("url", nargs="?", help="only update this subscription")
+    a.set_defaults(fn=cmd_sub_update)
+
+    a = sp.add_parser("list", help="list profiles")
+    a.set_defaults(fn=cmd_list)
+    sp.add_parser("ls", help="alias for list").set_defaults(fn=cmd_list)
+
+    a = sp.add_parser("rm", help="remove profile")
     a.add_argument("target", help="name or index")
     a.set_defaults(fn=cmd_rm)
 
-    a = sub.add_parser("default", help="set default profile")
+    a = sp.add_parser("default", help="set default profile")
     a.add_argument("target", help="name or index")
     a.set_defaults(fn=cmd_default)
 
-    a = sub.add_parser("up", help="connect")
+    a = sp.add_parser("up", help="connect")
     a.add_argument("name", nargs="?", help="profile name or index")
     a.add_argument("--no-bypass", action="store_true",
                    help="route all traffic via vpn (default: bypass ru sites)")
+    a.add_argument("--fallback", action="store_true",
+                   help="speed-test all profiles in parallel and connect to the fastest")
     a.set_defaults(fn=cmd_up)
 
-    a = sub.add_parser("down", help="disconnect")
+    a = sp.add_parser("down", help="disconnect")
     a.set_defaults(fn=cmd_down)
 
-    a = sub.add_parser("emergency-off", help="hard stop and clean tun/routes")
+    a = sp.add_parser("emergency-off", help="hard stop and clean tun/routes")
     a.set_defaults(fn=cmd_emergency)
 
-    a = sub.add_parser("status", help="show status")
+    a = sp.add_parser("status", help="show status")
     a.set_defaults(fn=cmd_status)
 
-    a = sub.add_parser("stats", help="show session traffic")
+    a = sp.add_parser("stats", help="show session traffic")
     a.add_argument("-f", "--follow", action="store_true")
     a.set_defaults(fn=cmd_stats)
+
+    a = sp.add_parser("speedtest", help="parallel latency test of all profiles")
+    a.set_defaults(fn=cmd_speedtest)
 
     return p
 
 
-def main(argv=None) -> int:
+def main(argv: "list[str] | None" = None) -> int:
+    """CLI entry point: dispatch ``argv`` to a command, or launch the TUI."""
     if argv is None:
         argv = sys.argv[1:]
 

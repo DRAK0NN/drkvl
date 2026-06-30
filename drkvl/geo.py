@@ -1,8 +1,9 @@
+import shutil
 import urllib.request
 from pathlib import Path
 from typing import Optional
 
-from . import profile
+from . import ownership, paths
 from .util import info
 
 # v2fly publishes canonical geosite (`category-ru`, `category-cn`, etc.)
@@ -28,31 +29,36 @@ def _has_all(d: Path) -> bool:
 
 
 def find() -> Optional[Path]:
-    for d in [profile.ASSETS, *SYSTEM_DIRS]:
+    """Return a directory holding both geo .dat files, or None if none has them."""
+    for d in [paths.ASSETS, *SYSTEM_DIRS]:
         if _has_all(d):
             return d
     return None
 
 
 def ensure() -> Path:
+    """Return a dir with the geo assets, downloading them from v2fly if absent."""
     d = find()
     if d:
         return d
 
-    profile.ASSETS.mkdir(parents=True, exist_ok=True)
-    profile.chown_user(profile.ASSETS)
+    paths.ASSETS.mkdir(parents=True, exist_ok=True)
+    ownership.chown_user(paths.ASSETS)
     for name, url in SOURCES.items():
-        target = profile.ASSETS / name
+        target = paths.ASSETS / name
         if target.exists() and target.stat().st_size > 0:
             continue
         info(f"downloading {name} from v2fly")
         tmp = target.with_suffix(target.suffix + ".part")
         try:
-            urllib.request.urlretrieve(url, tmp)
+            # timeout so a stalled mirror can't hang the whole CLI forever
+            with urllib.request.urlopen(url, timeout=30) as resp, \
+                    open(tmp, "wb") as out:
+                shutil.copyfileobj(resp, out)
             tmp.rename(target)
         except Exception as e:
             tmp.unlink(missing_ok=True)
             raise RuntimeError(f"failed to download {name}: {e}")
-        profile.chown_user(target)
+        ownership.chown_user(target)
 
-    return profile.ASSETS
+    return paths.ASSETS

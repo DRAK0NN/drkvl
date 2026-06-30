@@ -43,7 +43,8 @@ install_xray() {
         return
     fi
     info "installing xray $XRAY_VER"
-    local tmp=$(mktemp -d)
+    local tmp
+    tmp=$(mktemp -d) || die "mktemp failed"
     local url="https://github.com/XTLS/Xray-core/releases/download/v${XRAY_VER}/Xray-linux-${xray_arch}.zip"
     curl -sL "$url" -o "$tmp/xray.zip" || die "failed to download xray"
     unzip -qo "$tmp/xray.zip" xray -d "$tmp" || die "failed to extract xray"
@@ -59,7 +60,8 @@ install_tun2socks() {
         return
     fi
     info "installing tun2socks $TUN2SOCKS_VER"
-    local tmp=$(mktemp -d)
+    local tmp
+    tmp=$(mktemp -d) || die "mktemp failed"
     local url="https://github.com/xjasonlyu/tun2socks/releases/download/v${TUN2SOCKS_VER}/tun2socks-linux-${t2s_arch}.zip"
     curl -sL "$url" -o "$tmp/t2s.zip" || die "failed to download tun2socks"
     unzip -qo "$tmp/t2s.zip" tun2socks-linux-${t2s_arch} -d "$tmp" || die "failed to extract tun2socks"
@@ -82,12 +84,15 @@ install_deps_pm() {
     local pm="$1"
     case "$pm" in
         nix)
+            has curl  || nix-env -iA nixpkgs.curl  2>/dev/null || true
+            has unzip || nix-env -iA nixpkgs.unzip 2>/dev/null || true
             install_xray
             install_tun2socks_nix
             ;;
         pacman)
             has python3 || pacman -S --noconfirm python
             has unzip   || pacman -S --noconfirm unzip
+            has curl    || pacman -S --noconfirm curl
             has ip      || pacman -S --noconfirm iproute2
             has git     || pacman -S --noconfirm git
             install_xray
@@ -106,6 +111,7 @@ install_deps_pm() {
         dnf)
             has python3 || dnf install -y python3
             has unzip   || dnf install -y unzip
+            has curl    || dnf install -y curl
             has ip      || dnf install -y iproute
             has git     || dnf install -y git
             install_xray
@@ -114,6 +120,7 @@ install_deps_pm() {
         zypper)
             has python3 || zypper install -y python3
             has unzip   || zypper install -y unzip
+            has curl    || zypper install -y curl
             has ip      || zypper install -y iproute2
             has git     || zypper install -y git
             install_xray
@@ -165,7 +172,8 @@ check_python() {
     if ! has python3; then
         die "python3 not found"
     fi
-    local ver=$(python3 -c 'import sys; print(sys.version_info >= (3,9))' 2>/dev/null)
+    local ver
+    ver=$(python3 -c 'import sys; print(sys.version_info >= (3,9))' 2>/dev/null)
     [ "$ver" = "True" ] || die "python >= 3.9 required"
 }
 
