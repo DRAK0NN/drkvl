@@ -3,8 +3,8 @@ import os
 import sys
 import time
 
-from . import (clash, config, display, geo, link, ownership, paths, proc,
-               speed, state, stats, storage, sub, tun)
+from . import (bypass, clash, config, display, geo, link, ownership, paths,
+               proc, speed, state, stats, storage, sub, tun)
 from .util import fmt_bytes, have, info, warn, err, resolve_host, port_open
 
 
@@ -391,8 +391,127 @@ def cmd_stats(a) -> int:
     return 0
 
 
+def cmd_bypass_import(a) -> int:
+    """Import an Amnezia bypass JSON file into the custom direct-routing lists."""
+    try:
+        st = bypass.import_file(a.file)
+    except RuntimeError as e:
+        err(str(e))
+        return 1
+    print(display.bypass_import_line(st, color=sys.stdout.isatty()))
+    return 0
+
+
+def cmd_bypass_list(a) -> int:
+    """Show how many custom bypass domains/IPs are currently active."""
+    nd, ni = bypass.stats()
+    for line in display.bypass_status_lines(nd, ni, color=sys.stdout.isatty()):
+        print(line)
+    return 0
+
+
+def cmd_bypass_clear(a) -> int:
+    """Remove the custom bypass lists."""
+    bypass.clear()
+    info("custom bypass lists removed")
+    return 0
+
+
+def _full_test_one(name: str, v: link.Vless, bypass: bool, asset_dir) -> "speed.Result":
+    """Bring the real TUN stack up for one profile, curl THROUGH the tun, tear down.
+
+    Mirrors a real `up` (xray with fwmark -> tun2socks -> route swap) so the
+    latency is authoritative; always restores the network in a finally.
+    """
+    try:
+        server_ip = resolve_host(v.host)
+    except RuntimeError as e:
+        warn(f"{name}: {e}")
+        return speed.Result(name, v.host, v.port, None, "error")
+    cfg = config.build(v, bypass=bypass, direct_mark=tun.DIRECT_FWMARK,
+                       mark=tun.DIRECT_FWMARK)
+    ownership.ensure_dirs()
+    config.dump(cfg, paths.XRAY_CONFIG)
+    ownership.chown_user(paths.XRAY_CONFIG)
+    try:
+        proc.start_xray(paths.XRAY_CONFIG, asset_dir=asset_dir)
+    except RuntimeError as e:
+        warn(f"{name}: xray failed to start ({e})")
+        return speed.Result(name, v.host, v.port, None, "error")
+    if not _await_socks(config.SOCKS_PORT, attempts=100, delay=0.1):   # 10s
+        warn(f"{name}: socks port {config.SOCKS_PORT} did not open")
+        proc.stop_xray()
+        return speed.Result(name, v.host, v.port, None, "error")
+    try:
+        tun.apply_up(server_ip, config.SOCKS_PORT)
+    except (RuntimeError, OSError) as e:
+        warn(f"{name}: routing setup failed ({e})")
+        proc.stop_xray()
+        try:
+            tun.apply_down(tun.load_snapshot())
+        except Exception:
+            pass
+        return speed.Result(name, v.host, v.port, None, "error")
+    try:
+        status, latency = speed.curl_direct(timeout=10)
+    finally:
+        proc.stop_xray()
+        try:
+            tun.apply_down(tun.load_snapshot())
+        except Exception as e:
+            warn(f"{name}: teardown warning: {e}")
+    return speed.Result(name, v.host, v.port, latency, status)
+
+
+def _speedtest_full(profiles) -> int:
+    """Serial, authoritative speed test through the real TUN stack (needs root)."""
+    if not _require_root():
+        return 1
+    if proc.xray_running() or proc.tun2socks_running() or tun.dev_exists():
+        err("already up — run 'drkvl down' first")
+        return 1
+    if port_open(config.SOCKS_PORT):
+        err(f"port {config.SOCKS_PORT} already in use")
+        return 1
+    if not have("tun2socks"):
+        err("tun2socks not found in PATH")
+        return 1
+    gw = tun.default_route() or {}
+    if not gw.get("dev"):
+        err("no default route on this host")
+        return 1
+    try:
+        asset_dir = geo.ensure()
+    except RuntimeError as e:
+        err(str(e))
+        warn("hint: place geosite.dat/geoip.dat in ~/.config/drkvl/assets/")
+        return 1
+
+    warn(f"full test: connecting each of {len(profiles)} profile(s) through the TUN, "
+         f"one at a time — slow, and briefly disrupts your network")
+    stopped_clash = clash.stop_active()
+    results = []
+    try:
+        for name, v in profiles:
+            info(f"testing '{name}' ({v.host}:{v.port})...")
+            results.append(_full_test_one(name, v, True, asset_dir))
+    finally:
+        clash.start(stopped_clash)
+        for f in (proc.TUN2SOCKS_PID, paths.BACKUP, paths.RESOLV_BAK):
+            storage.clear(f)
+
+    for line in display.speed_table(results, color=sys.stdout.isatty()):
+        print(line)
+    return 0
+
+
 def cmd_speedtest(a) -> int:
-    """Speed-test all profiles in parallel and print a latency table (no connection)."""
+    """Speed-test all profiles and print a latency table.
+
+    Default: fast parallel socks-only test (no root, no connection). ``--full``
+    connects each profile through the real TUN stack one at a time (needs root)
+    — slow but authoritative.
+    """
     profiles = storage.list_all()
     if not profiles:
         err("no profiles")
@@ -400,6 +519,8 @@ def cmd_speedtest(a) -> int:
     if not have("xray"):
         err("xray not found in PATH")
         return 1
+    if getattr(a, "full", False):
+        return _speedtest_full(profiles)
     info(f"speed-testing {len(profiles)} profile(s)...")
     results = speed.run_tests(profiles)
     for line in display.speed_table(results, color=sys.stdout.isatty()):
@@ -459,7 +580,19 @@ def build_parser() -> argparse.ArgumentParser:
     a.set_defaults(fn=cmd_stats)
 
     a = sp.add_parser("speedtest", help="parallel latency test of all profiles")
+    a.add_argument("--full", action="store_true",
+                   help="authoritative test through the real TUN stack (needs root, slow)")
     a.set_defaults(fn=cmd_speedtest)
+
+    a = sp.add_parser("bypass-import", help="import custom bypass list (Amnezia JSON)")
+    a.add_argument("file", help="path to the Amnezia JSON file")
+    a.set_defaults(fn=cmd_bypass_import)
+
+    a = sp.add_parser("bypass-list", help="show custom bypass stats")
+    a.set_defaults(fn=cmd_bypass_list)
+
+    a = sp.add_parser("bypass-clear", help="remove custom bypass lists")
+    a.set_defaults(fn=cmd_bypass_clear)
 
     return p
 

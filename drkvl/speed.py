@@ -34,17 +34,17 @@ class Result:
     status: str            # "ok" | "timeout" | "error"
 
 
-def _curl(socks_port: int) -> tuple[str, Optional[float]]:
-    """Measure round-trip latency through the socks proxy; return (status, latency_ms)."""
+def _run_curl(prefix: list, timeout: int) -> tuple[str, Optional[float]]:
+    """Run curl to the ping URL with ``prefix`` args; return (status, latency_ms).
+
+    time_starttransfer measures the real round-trip to the server (not just the
+    local handshake). status is ok / timeout / error.
+    """
     try:
         r = subprocess.run(
-            # socks5h:// resolves DNS through the proxy (the tunnel);
-            # time_starttransfer measures the real round-trip to the server,
-            # not just the local socks handshake.
-            ["curl", "-x", f"socks5h://127.0.0.1:{socks_port}",
-             "-so", "/dev/null", "-w", "%{time_starttransfer}",
-             "--connect-timeout", str(CONNECT_TIMEOUT), PING_URL],
-            capture_output=True, text=True, timeout=CONNECT_TIMEOUT + 5)
+            ["curl", *prefix, "-so", "/dev/null", "-w", "%{time_starttransfer}",
+             "--connect-timeout", str(timeout), PING_URL],
+            capture_output=True, text=True, timeout=timeout + 5)
     except (subprocess.SubprocessError, OSError):
         return "error", None
     if r.returncode == 28:
@@ -55,6 +55,17 @@ def _curl(socks_port: int) -> tuple[str, Optional[float]]:
         return "ok", float(r.stdout.strip()) * 1000.0
     except ValueError:
         return "error", None
+
+
+def _curl(socks_port: int, timeout: int = CONNECT_TIMEOUT) -> tuple[str, Optional[float]]:
+    """Measure round-trip latency through the socks proxy (socks5h = proxy-side DNS)."""
+    return _run_curl(["-x", f"socks5h://127.0.0.1:{socks_port}"], timeout)
+
+
+def curl_direct(timeout: int = CONNECT_TIMEOUT) -> tuple[str, Optional[float]]:
+    """Measure round-trip over the current default route (no proxy) — used by --full,
+    where the route has been swapped to the TUN so this exercises the whole stack."""
+    return _run_curl([], timeout)
 
 
 def _run_xray(cfg_path: str, socks_port: int, timeout: float = 3.0):

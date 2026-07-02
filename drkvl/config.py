@@ -126,6 +126,12 @@ def build(v: Vless, socks_port: int = SOCKS_PORT, api_port: int = API_PORT,
         # them to a side table whose default is the physical gw.
         direct["streamSettings"] = {"sockopt": {"mark": direct_mark}}
 
+    dns_out: dict = {"tag": "dns-out", "protocol": "dns"}
+    if direct_mark:
+        # same as `direct`: without the mark, dns-out's queries to 1.1.1.1
+        # egress via the new drkvl0 default and loop back through socks-in.
+        dns_out["streamSettings"] = {"sockopt": {"mark": direct_mark}}
+
     return {
         "log": {"loglevel": "warning"},
         "dns": {
@@ -172,7 +178,7 @@ def build(v: Vless, socks_port: int = SOCKS_PORT, api_port: int = API_PORT,
             },
             direct,
             {"tag": "block", "protocol": "blackhole"},
-            {"tag": "dns-out", "protocol": "dns"},
+            dns_out,
         ],
         "routing": _routing(bypass, geo),
     }
@@ -189,9 +195,13 @@ def _routing(bypass: bool, geo: bool = True) -> dict:
         # routing private/LAN traffic direct needs geoip.dat at parse time
         rules.append({"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"})
     if bypass:
+        # merge any custom bypass lists imported via `drkvl bypass-import`
+        from . import bypass as _bypass
+        domains = ["geosite:category-ru"] + [f"domain:{d}" for d in _bypass.load_domains()]
+        ips = ["geoip:ru"] + _bypass.load_ips()
         rules += [
-            {"type": "field", "domain": ["geosite:category-ru"], "outboundTag": "direct"},
-            {"type": "field", "ip": ["geoip:ru"], "outboundTag": "direct"},
+            {"type": "field", "domain": domains, "outboundTag": "direct"},
+            {"type": "field", "ip": ips, "outboundTag": "direct"},
         ]
     rules.append({"type": "field", "port": "0-65535", "outboundTag": "proxy"})
     return {

@@ -61,6 +61,26 @@ class TestCurl(unittest.TestCase):
             self.assertEqual(speed._curl(1090), ("error", None))
 
 
+class TestCurlDirect(unittest.TestCase):
+    def test_direct_has_no_proxy_arg(self):
+        with mock.patch.object(speed.subprocess, "run", return_value=_cp(0, "0.05")) as m:
+            status, ms = speed.curl_direct()
+        self.assertEqual(status, "ok")
+        self.assertAlmostEqual(ms, 50.0, places=1)
+        argv = m.call_args.args[0]
+        self.assertNotIn("-x", argv)          # goes through the default route (the TUN)
+        self.assertIn("%{time_starttransfer}", argv)
+        self.assertIn(speed.PING_URL, argv)
+
+    def test_direct_timeout(self):
+        with mock.patch.object(speed.subprocess, "run", return_value=_cp(28)):
+            self.assertEqual(speed.curl_direct()[0], "timeout")
+
+    def test_direct_error(self):
+        with mock.patch.object(speed.subprocess, "run", side_effect=OSError):
+            self.assertEqual(speed.curl_direct(), ("error", None))
+
+
 class TestTestOne(unittest.TestCase):
     def test_error_when_xray_does_not_start(self):
         with mock.patch.object(speed, "_run_xray", return_value=None):
@@ -105,6 +125,8 @@ class TestTestOne(unittest.TestCase):
              mock.patch.object(speed, "_run_xray", return_value=None):
             speed._test_one(0, "p", V)
         self.assertFalse(kw.get("geo", True), "speed config must pass geo=False")
+        self.assertFalse(kw.get("bypass", True),
+                         "speed config must pass bypass=False (no custom bypass lists)")
 
 
 class TestRunXrayDeath(unittest.TestCase):
@@ -234,6 +256,63 @@ class TestCliIntegration(unittest.TestCase):
             cli.cmd_up(self._up_args())
         # only responders, fastest first, dead excluded
         self.assertEqual(captured.get("names"), ["fast", "slow"])
+
+
+class TestFullTest(unittest.TestCase):
+    def test_full_success_and_teardown(self):
+        with mock.patch.object(cli, "resolve_host", return_value="9.9.9.9"), \
+             mock.patch.object(cli.config, "build", return_value={}), \
+             mock.patch.object(cli.config, "dump"), \
+             mock.patch.object(cli.ownership, "ensure_dirs"), \
+             mock.patch.object(cli.ownership, "chown_user"), \
+             mock.patch.object(cli.proc, "start_xray"), \
+             mock.patch.object(cli.proc, "stop_xray") as stopx, \
+             mock.patch.object(cli, "_await_socks", return_value=True), \
+             mock.patch.object(cli.tun, "apply_up"), \
+             mock.patch.object(cli.tun, "apply_down") as adown, \
+             mock.patch.object(cli.tun, "load_snapshot", return_value={}), \
+             mock.patch.object(cli.speed, "curl_direct", return_value=("ok", 42.0)):
+            r = cli._full_test_one("p", V, True, None)
+        self.assertEqual(r.status, "ok")
+        self.assertEqual(r.latency_ms, 42.0)
+        stopx.assert_called()       # xray torn down
+        adown.assert_called()       # routes torn down
+
+    def test_full_xray_fail_skips_applyup(self):
+        with mock.patch.object(cli, "resolve_host", return_value="9.9.9.9"), \
+             mock.patch.object(cli.config, "build", return_value={}), \
+             mock.patch.object(cli.config, "dump"), \
+             mock.patch.object(cli.ownership, "ensure_dirs"), \
+             mock.patch.object(cli.ownership, "chown_user"), \
+             mock.patch.object(cli.proc, "start_xray", side_effect=RuntimeError("boom")), \
+             mock.patch.object(cli.tun, "apply_up") as aup:
+            r = cli._full_test_one("p", V, True, None)
+        self.assertEqual(r.status, "error")
+        aup.assert_not_called()
+
+    def test_full_applyup_fail_tears_down(self):
+        with mock.patch.object(cli, "resolve_host", return_value="9.9.9.9"), \
+             mock.patch.object(cli.config, "build", return_value={}), \
+             mock.patch.object(cli.config, "dump"), \
+             mock.patch.object(cli.ownership, "ensure_dirs"), \
+             mock.patch.object(cli.ownership, "chown_user"), \
+             mock.patch.object(cli.proc, "start_xray"), \
+             mock.patch.object(cli.proc, "stop_xray") as stopx, \
+             mock.patch.object(cli, "_await_socks", return_value=True), \
+             mock.patch.object(cli.tun, "apply_up", side_effect=RuntimeError("route")), \
+             mock.patch.object(cli.tun, "apply_down") as adown, \
+             mock.patch.object(cli.tun, "load_snapshot", return_value={}):
+            r = cli._full_test_one("p", V, True, None)
+        self.assertEqual(r.status, "error")
+        stopx.assert_called()
+        adown.assert_called()
+
+    def test_speedtest_full_requires_root(self):
+        args = types.SimpleNamespace(full=True)
+        with mock.patch.object(cli.storage, "list_all", return_value=[("a", V)]), \
+             mock.patch.object(cli, "have", return_value=True), \
+             mock.patch.object(cli, "_require_root", return_value=False):
+            self.assertEqual(cli.cmd_speedtest(args), 1)
 
 
 if __name__ == "__main__":

@@ -100,6 +100,21 @@ def vpn_ip_line(socks_port: int, color: bool = False) -> str:
     return "VPN IP: check manually (curl ifconfig.me)"
 
 
+def bypass_import_line(stats: dict, color: bool = False) -> str:
+    """Render the one-line summary printed after ``bypass-import``."""
+    d, i, s = stats.get("domains", 0), stats.get("ips", 0), stats.get("skipped", 0)
+    return (f"custom bypass: {_c('32', '+' + str(d), color)} domains, "
+            f"{_c('32', '+' + str(i), color)} IPs ({s} skipped)")
+
+
+def bypass_status_lines(n_domains: int, n_ips: int, color: bool = False) -> list[str]:
+    """Render the ``bypass-list`` status (a hint when nothing is imported)."""
+    if not (n_domains or n_ips):
+        return ["no custom bypass list — import one with 'drkvl bypass-import <file.json>'"]
+    return [f"custom bypass: {_c('36', str(n_domains), color)} domains, "
+            f"{_c('36', str(n_ips), color)} IPs"]
+
+
 def speed_table(results, color: bool = False) -> list[str]:
     """Render speed-test Results as aligned lines: header + one row per profile.
 

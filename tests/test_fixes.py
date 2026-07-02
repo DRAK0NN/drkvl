@@ -21,7 +21,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from drkvl import (link, profile, config, stats, proc, geo, util, tun, cli,
-                   tui, paths, ownership, storage, state, display)
+                   tui, paths, ownership, storage, state, display, bypass)
 from drkvl.link import Vless
 
 
@@ -174,6 +174,61 @@ class TestConfigStatsFixes(unittest.TestCase):
     def test_default_keeps_geoip_private(self):
         cfg = config.build(Vless(uuid="u", host="h", port=443))
         self.assertIn("geoip:private", json.dumps(cfg))
+
+    def _direct_rule(self, cfg, marker):
+        # return the 'direct' rule's list that contains ``marker`` (skips the
+        # geoip:private rule, which is also direct+ip)
+        key = "domain" if marker.startswith("geosite") else "ip"
+        for r in cfg["routing"]["rules"]:
+            if r.get("outboundTag") == "direct" and marker in r.get(key, []):
+                return r[key]
+        return None
+
+    def test_bypass_merges_custom_domains_and_ips(self):
+        with mock.patch.object(bypass, "load_domains", return_value=["avito.st", "2gis.com"]), \
+             mock.patch.object(bypass, "load_ips", return_value=["1.2.3.0/24", "5.6.7.8"]):
+            cfg = config.build(Vless(uuid="u", host="h", port=443), bypass=True)
+        domains = self._direct_rule(cfg, "geosite:category-ru")
+        self.assertIn("domain:avito.st", domains)
+        self.assertIn("domain:2gis.com", domains)
+        ips = self._direct_rule(cfg, "geoip:ru")
+        self.assertIn("1.2.3.0/24", ips)
+        self.assertIn("5.6.7.8", ips)
+
+    def test_bypass_without_custom_is_geo_only(self):
+        with mock.patch.object(bypass, "load_domains", return_value=[]), \
+             mock.patch.object(bypass, "load_ips", return_value=[]):
+            cfg = config.build(Vless(uuid="u", host="h", port=443), bypass=True)
+        self.assertEqual(self._direct_rule(cfg, "geosite:category-ru"), ["geosite:category-ru"])
+        self.assertEqual(self._direct_rule(cfg, "geoip:ru"), ["geoip:ru"])
+
+    # bug 2: dns-out must carry the direct fwmark so DNS egresses via the side
+    # table instead of looping back through the tun
+    def _dns_out(self, cfg):
+        return [o for o in cfg["outbounds"] if o["tag"] == "dns-out"][0]
+
+    def test_dns_out_has_direct_mark(self):
+        cfg = config.build(Vless(uuid="u", host="h", port=443), direct_mark=0xDD0DE)
+        dns = self._dns_out(cfg)
+        self.assertEqual(dns.get("streamSettings", {}).get("sockopt", {}).get("mark"),
+                         0xDD0DE)
+
+    def test_dns_out_no_mark_when_zero(self):
+        cfg = config.build(Vless(uuid="u", host="h", port=443), direct_mark=0)
+        self.assertNotIn("streamSettings", self._dns_out(cfg))
+
+    # bug 3: speed-test configs (bypass=False) must NOT load the custom bypass
+    # lists (10k+ IPs) — that made every temp xray fail
+    def test_bypass_false_does_not_load_lists(self):
+        with mock.patch.object(bypass, "load_domains") as ld, \
+             mock.patch.object(bypass, "load_ips") as li:
+            cfg = config.build(Vless(uuid="u", host="h", port=443),
+                               bypass=False, geo=False)
+        ld.assert_not_called()
+        li.assert_not_called()
+        blob = json.dumps(cfg)
+        self.assertNotIn("geoip:ru", blob)
+        self.assertNotIn("geosite", blob)
 
 
 # ---------------------------------------------------------------------------
@@ -477,6 +532,41 @@ class TestVpnIp(unittest.TestCase):
         with mock.patch.object(display, "vpn_ip", return_value=None):
             self.assertEqual(display.vpn_ip_line(1080),
                              "VPN IP: check manually (curl ifconfig.me)")
+
+
+# ---------------------------------------------------------------------------
+# bug 1: CONNMARK restore-mark must be inserted at PREROUTING position 1
+# (before the nixos rpfilter rule), not appended
+# ---------------------------------------------------------------------------
+
+class TestConnmarkPrerouting(unittest.TestCase):
+    def test_prerouting_restore_inserted_at_top(self):
+        calls = []
+
+        def fake_run(cmd, **k):
+            calls.append(cmd)
+            return (1 if "-D" in cmd else 0, "", "")   # -D loops break immediately
+
+        with mock.patch.object(tun, "_run", side_effect=fake_run):
+            tun._install_mark_rules()
+
+        adds = [c for c in calls if "-A" in c or "-I" in c]
+        pre = [c for c in adds if "PREROUTING" in c]
+        self.assertEqual(len(pre), 1)
+        c = pre[0]
+        self.assertNotIn("-A", c)                       # must not append
+        i = c.index("-I")
+        self.assertEqual(c[i:i + 3], ["-I", "PREROUTING", "1"])
+        self.assertIn("--restore-mark", c)
+
+    def test_output_savemark_still_appended(self):
+        calls = []
+        with mock.patch.object(tun, "_run",
+                               side_effect=lambda cmd, **k: calls.append(cmd) or (1 if "-D" in cmd else 0, "", "")):
+            tun._install_mark_rules()
+        out = [c for c in calls if ("-A" in c or "-I" in c) and "OUTPUT" in c]
+        self.assertEqual(len(out), 1)
+        self.assertIn("--save-mark", out[0])
 
 
 # ---------------------------------------------------------------------------

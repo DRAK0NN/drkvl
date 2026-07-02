@@ -79,7 +79,10 @@ _CMD_HELP = [
     ("down", "disconnect"),
     ("status, st", "show status"),
     ("stats", "show traffic"),
-    ("speedtest", "latency-test all profiles"),
+    ("speedtest [--full]", "latency-test all profiles"),
+    ("bypass-import <file>", "import Amnezia bypass list"),
+    ("bypass-list", "show custom bypass stats"),
+    ("bypass-clear", "clear custom bypass list"),
     ("rm <name|index>", "remove profile"),
     ("default <name|index>", "set default"),
     ("emergency-off", "hard stop + clean"),
@@ -134,7 +137,8 @@ def _do_stats():
 
 
 _CMDS = ["list", "ls", "add", "sub", "sub-update", "up", "down", "status",
-         "st", "stats", "speedtest", "rm", "default", "emergency-off", "help",
+         "st", "stats", "speedtest", "bypass-import", "bypass-list",
+         "bypass-clear", "rm", "default", "emergency-off", "help",
          "exit", "quit", "q"]
 
 
@@ -191,7 +195,16 @@ def run() -> int:
         elif cmd == "stats":
             _do_stats()
         elif cmd == "speedtest":
-            _dispatch(["speedtest"])
+            _dispatch(["speedtest"] + args)
+        elif cmd == "bypass-import":
+            if not args:
+                _err("usage: bypass-import <file.json>")
+            else:
+                _dispatch(["bypass-import"] + args)
+        elif cmd == "bypass-list":
+            _dispatch(["bypass-list"])
+        elif cmd == "bypass-clear":
+            _dispatch(["bypass-clear"])
         elif cmd == "add":
             if not args:
                 _err("usage: add <vless://...> [-n name]")

@@ -271,8 +271,11 @@ def _iptables_del_all(chain: str, args: list[str]) -> None:
 def _install_mark_rules() -> None:
     for chain, args in _MARK_RULES:
         _iptables_del_all(chain, args)
-        _run(["iptables", "-w", "-t", "mangle", "-A", chain, *args],
-             check=True)
+        # the PREROUTING restore-mark MUST run before nixos' rpfilter rule
+        # (also in mangle PREROUTING) or SYN-ACK replies are dropped before
+        # their fwmark is restored — so insert it at the top instead of -A.
+        op = ["-I", chain, "1"] if chain == "PREROUTING" else ["-A", chain]
+        _run(["iptables", "-w", "-t", "mangle", *op, *args], check=True)
 
 
 def _remove_mark_rules() -> None:
