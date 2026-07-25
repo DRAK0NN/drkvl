@@ -11,8 +11,8 @@ import re
 import urllib.parse
 import urllib.request
 
-from . import paths, storage
-from .link import Vless, parse
+from . import link, paths, storage
+from .link import Profile
 from .util import warn
 
 TIMEOUT = 10
@@ -70,20 +70,24 @@ def fetch(url: str, timeout: int = TIMEOUT) -> str:
         raise RuntimeError(str(e))
 
 
-def parse_links(body: str) -> tuple[list[Vless], int]:
-    """Parse decoded ``body`` into Vless objects; return (vless, n_skipped).
+_SUPPORTED = ("vless://", "hysteria2://", "hy2://")
 
-    Non-vless protocols (vmess/trojan/ss/...) and malformed vless links are
-    skipped with a warning and counted in ``n_skipped``.
+
+def parse_links(body: str) -> tuple[list[Profile], int]:
+    """Parse decoded ``body`` into profile objects; return (profiles, n_skipped).
+
+    Keeps vless:// and hysteria2:// (hy2://) links. Other protocols
+    (vmess/trojan/ss/...) and malformed links are skipped with a warning and
+    counted in ``n_skipped``.
     """
-    vless: list[Vless] = []
+    profiles: list[Profile] = []
     skipped = 0
     seen: set[str] = set()
     for line in body.splitlines():
         line = line.strip()
         if not line:
             continue
-        if not line.startswith("vless://"):
+        if not line.lower().startswith(_SUPPORTED):
             if "://" in line:
                 proto = line.split("://", 1)[0]
                 warn(f"skipping unsupported {proto}:// link")
@@ -93,11 +97,11 @@ def parse_links(body: str) -> tuple[list[Vless], int]:
             continue
         seen.add(line)
         try:
-            vless.append(parse(line))
+            profiles.append(link.parse_any(line))
         except ValueError as e:
-            warn(f"skipping malformed vless link: {e}")
+            warn(f"skipping malformed link: {e}")
             skipped += 1
-    return vless, skipped
+    return profiles, skipped
 
 
 def next_index() -> int:
@@ -110,11 +114,11 @@ def next_index() -> int:
     return mx + 1
 
 
-def add_profiles(vlesses: list[Vless]) -> list[str]:
-    """Save each Vless as ``sub-N`` (continuing the global index); return the names."""
+def add_profiles(profiles: list[Profile]) -> list[str]:
+    """Save each profile as ``sub-N`` (continuing the global index); return the names."""
     idx = next_index()
     names = []
-    for v in vlesses:
+    for v in profiles:
         names.append(storage.save(v, name=f"sub-{idx}"))
         idx += 1
     return names

@@ -72,7 +72,7 @@ def _banner():
 
 _CMD_HELP = [
     ("list, ls", "list profiles"),
-    ("add <url> [-n name]", "add profile"),
+    ("add <url> [-n name]", "add profile (vless/hysteria2)"),
     ("sub <url>", "add subscription"),
     ("sub-update [url]", "refresh subscriptions"),
     ("up [name] [--no-bypass] [--fallback]", "connect"),
@@ -207,7 +207,7 @@ def run() -> int:
             _dispatch(["bypass-clear"])
         elif cmd == "add":
             if not args:
-                _err("usage: add <vless://...> [-n name]")
+                _err("usage: add <vless://... | hysteria2://...> [-n name]")
             else:
                 _dispatch(["add"] + args)
         elif cmd == "sub":

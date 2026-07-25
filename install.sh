@@ -2,6 +2,8 @@
 set -euo pipefail
 
 REPO="https://github.com/DRAK0NN/drkvl"
+# xray >= 26.5 for xhttp; the native hysteria2 outbound needs >= 26.3.
+# 26.5.9 satisfies both — keep this at or above 26.5.
 XRAY_VER="26.5.9"
 TUN2SOCKS_VER="2.6.0"
 

@@ -1,6 +1,6 @@
 import json
 import os
-from .link import Vless
+from .link import Vless, Profile
 
 SOCKS_PORT = 1080
 API_PORT = 10085
@@ -97,26 +97,96 @@ def _stream(v: Vless) -> dict:
     return st
 
 
-def build(v: Vless, socks_port: int = SOCKS_PORT, api_port: int = API_PORT,
+def _proxy_outbound(v: Profile, mark: int) -> dict:
+    """Build the ``proxy`` outbound for ``v`` (vless or hysteria)."""
+    if getattr(v, "kind", "vless") == "hy2":
+        return _hysteria_outbound(v, mark)
+
+    user = {"id": v.uuid, "encryption": v.encryption or "none"}
+    if v.flow:
+        user["flow"] = v.flow
+    proxy_stream = _stream(v)
+    if mark:
+        # SO_MARK: paired with `ip rule fwmark <m> lookup main` so the
+        # kernel ignores foreign policy routing (mihomo's table 2022 etc.).
+        proxy_stream["sockopt"] = {"mark": mark}
+    return {
+        "tag": "proxy",
+        "protocol": "vless",
+        "settings": {"vnext": [{
+            "address": v.host, "port": v.port, "users": [user],
+        }]},
+        "streamSettings": proxy_stream,
+    }
+
+
+# udphop interval floor (seconds). xray rejects a smaller value at config load:
+# infra/conf validates `Interval < 5 -> error`, and the dialer builds it as
+# `time.Duration(interval) * time.Second` (transport/internet/hysteria/dialer.go),
+# so the unit is SECONDS, not milliseconds. Below the floor we omit it and let
+# xray use its 30s default rather than fail the whole config.
+HY_HOP_INTERVAL_MIN = 5
+
+
+def _hysteria_outbound(v: Profile, mark: int) -> dict:
+    """Build the ``proxy`` outbound as an xray-native hysteria2 outbound.
+
+    Field placement is verified against XTLS/Xray-core v26.5.9 (infra/conf):
+      - salamander obfs -> streamSettings.finalmask.udp[] (a []conf.Mask); the
+        stream-level ``udpmasks`` key is silently ignored by xray.
+      - port-hopping -> streamSettings.finalmask.quicParams.udpHop; the
+        ``hysteriaSettings.udphop`` location is deprecated (Build only logs a
+        warning and never applies it).
+      - auth/version stay in hysteriaSettings.
+    Congestion control is left at xray's default (server runs
+    ``ignoreClientBandwidth``): quicParams carries ONLY udpHop, never
+    congestion/brutal/bandwidth. ``insecure`` is NOT mapped to allowInsecure
+    (removed from xray); verification can only be relaxed via a cert pin.
+    """
+    tls: dict = {"serverName": v.sni or v.host, "alpn": ["h3"]}
+    if v.pin_sha256:
+        tls["pinnedPeerCertSha256"] = v.pin_sha256
+
+    stream: dict = {
+        "network": "hysteria",
+        "security": "tls",
+        "tlsSettings": tls,
+        "hysteriaSettings": {"version": 2, "auth": v.auth},
+    }
+
+    finalmask: dict = {}
+    if v.obfs == "salamander" and v.obfs_password:
+        finalmask["udp"] = [
+            {"type": "salamander", "settings": {"password": v.obfs_password}}]
+    if v.ports:
+        hop: dict = {"ports": v.ports}
+        if v.hop_interval >= HY_HOP_INTERVAL_MIN:
+            hop["interval"] = v.hop_interval
+        finalmask["quicParams"] = {"udpHop": hop}
+    if finalmask:
+        stream["finalmask"] = finalmask
+
+    if mark:
+        stream["sockopt"] = {"mark": mark}
+    return {
+        "tag": "proxy",
+        "protocol": "hysteria",
+        "settings": {"version": 2, "address": v.host, "port": v.port},
+        "streamSettings": stream,
+    }
+
+
+def build(v: Profile, socks_port: int = SOCKS_PORT, api_port: int = API_PORT,
           mark: int = 0, bypass: bool = True, direct_mark: int = 0,
           geo: bool = True) -> dict:
     """Build the full xray config dict for ``v`` (socks inbound, routing, marks).
 
-    ``geo=False`` drops all geoip/geosite routing rules so the config needs no
-    .dat assets — used for throwaway speed-test xrays.
+    ``v`` may be a :class:`~drkvl.link.Vless` or :class:`~drkvl.link.Hy2`; only
+    the ``proxy`` outbound differs, everything else (routing, dns, marks) is
+    engine-agnostic. ``geo=False`` drops all geoip/geosite routing rules so the
+    config needs no .dat assets — used for throwaway speed-test xrays.
     """
-    user = {"id": v.uuid, "encryption": v.encryption or "none"}
-    if v.flow:
-        user["flow"] = v.flow
-
-    proxy_stream = _stream(v)
-    sockopt: dict = {}
-    if mark:
-        # SO_MARK: paired with `ip rule fwmark <m> lookup main` so the
-        # kernel ignores foreign policy routing (mihomo's table 2022 etc.).
-        sockopt["mark"] = mark
-    if sockopt:
-        proxy_stream["sockopt"] = sockopt
+    proxy_ob = _proxy_outbound(v, mark)
 
     direct: dict = {"tag": "direct", "protocol": "freedom"}
     if direct_mark:
@@ -164,18 +234,7 @@ def build(v: Vless, socks_port: int = SOCKS_PORT, api_port: int = API_PORT,
             },
         ],
         "outbounds": [
-            {
-                "tag": "proxy",
-                "protocol": "vless",
-                "settings": {
-                    "vnext": [{
-                        "address": v.host,
-                        "port": v.port,
-                        "users": [user],
-                    }]
-                },
-                "streamSettings": proxy_stream,
-            },
+            proxy_ob,
             direct,
             {"tag": "block", "protocol": "blackhole"},
             dns_out,

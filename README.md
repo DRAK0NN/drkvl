@@ -38,6 +38,7 @@ VLESS VPN client for Linux. TUN mode — all system traffic through VPN.
 ## features
 
 - VLESS + Reality + xhttp (post-quantum ML-DSA-65 supported)
+- **Hysteria2** (native xray outbound: udp port-hopping + salamander obfs)
 - full TUN routing via `tun2socks` + `xray` socks5
 - **subscriptions**: import a base64 link list, refresh in place
 - **speedtest**: parallel latency test of every profile
@@ -47,13 +48,13 @@ VLESS VPN client for Linux. TUN mode — all system traffic through VPN.
 - DNS over TCP through xray (no UDP leaks); resolv.conf saved + restored
 - split routing with fwmark + connmark (NixOS rpfilter compatible)
 - interactive TUI with tab completion
-- stdlib only — no third-party deps; 210 unit tests
+- stdlib only — no third-party deps; 304 unit tests
 
 ## requires
 
 | dep | version |
 |-----|---------|
-| xray | >= 26.5 (xhttp support) |
+| xray | >= 26.5 (xhttp); hysteria2 outbound needs >= 26.3 |
 | tun2socks | any |
 | iproute2 | any |
 | curl | any (subscriptions / speedtest) |
@@ -131,12 +132,13 @@ drkvl honours `SUDO_USER` — profiles stay under the invoking user's `~/.config
 Import a subscription URL (a base64-encoded, newline-separated link list):
 
 ```sh
-drkvl sub https://example.com/sub      # import its vless:// profiles as sub-0, sub-1, ...
+drkvl sub https://example.com/sub      # import its vless:// / hysteria2:// profiles as sub-0, sub-1, ...
 drkvl sub-update                       # re-fetch every saved subscription, replace its profiles
 drkvl sub-update https://example.com/sub   # update just that one
 ```
 
-Non-vless links (`vmess` / `trojan` / `ss`) are skipped with a warning. http/https
+`vless://` and `hysteria2://` (`hy2://`) links are kept; other protocols
+(`vmess` / `trojan` / `ss`) are skipped with a warning. http/https
 only; the body is capped at 4 MiB. URLs are remembered in
 `~/.config/drkvl/subscriptions.json`; a failed refresh keeps the old profiles.
 
@@ -171,6 +173,40 @@ pbk, sid, spx, pqv         reality
 ```
 
 Fragment `#name` sets the profile name.
+
+## hysteria2 link
+
+drkvl runs Hysteria2 as a **native xray outbound** (`protocol: hysteria`,
+version 2) — no second binary, so TUN routing, kill-switch, RU-bypass, stats and
+speedtest all work exactly as with vless.
+
+```sh
+drkvl add "hysteria2://<auth>@host:443?sni=example.com&obfs=salamander&obfs-password=secret#node"
+```
+
+Supported `hysteria2://` (alias `hy2://`) params:
+
+```
+<auth>@host:port           password is the userinfo (or ?auth=)
+sni                        TLS SNI (defaults to host)
+obfs=salamander            + obfs-password   salamander udp obfuscation
+pinSHA256                  pin the server cert (hex, colons ok, or base64)
+mport / hopInterval        udp port-hopping range + interval (seconds, >= 5)
+insecure=1                 see caveat below
+```
+
+Congestion control is left at xray's default (BBR) — drkvl never emits a
+`bandwidth`/`brutal` block, matching a server on `ignoreClientBandwidth`.
+
+- **`insecure=1` needs a pin.** xray removed `allowInsecure`; TLS verification
+  can only be relaxed via `pinSHA256`. A profile with `insecure=1` and no pin is
+  **refused on `up`/`speedtest`** (it would just fail the handshake) — supply
+  `pinSHA256`, or use a server with a valid certificate.
+- **salamander caveat.** salamander between a hysteria2 *server* and the xray
+  *client* is known-broken ([Xray-core#5712](https://github.com/XTLS/Xray-core/issues/5712),
+  closed *not planned*): packets arrive but the server stays silent, even at
+  debug loglevel. If a salamander profile dies, test the same server **without**
+  `obfs` first to isolate it.
 
 ## caveats
 

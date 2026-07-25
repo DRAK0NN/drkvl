@@ -1,7 +1,9 @@
 import os
+import re
 import signal
 import subprocess
 import time
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
@@ -12,6 +14,42 @@ XRAY_PID = paths.HOME / "xray.pid"
 TUN2SOCKS_PID = paths.HOME / "tun2socks.pid"
 XRAY_LOG = paths.HOME / "xray.log"
 TUN2SOCKS_LOG = paths.HOME / "tun2socks.log"
+
+# Minimum xray for the hysteria2 config drkvl emits. The binding constraint is
+# port-hopping: xray accepts udphop under finalmask.quicParams.udpHop only from
+# 26.3 (XTLS/Xray-core #5772, 2026-03-09 "Unified Finalmask's quicParams");
+# earlier 26.x kept it under hysteriaSettings.udphop, which 26.3+ ignores.
+# Verified by bisecting release tags: finalmask.quicParams.udpHop is absent at
+# v26.2.6 and present at v26.3.23 (the earliest 26.3 release). Salamander
+# (finalmask.udp, renamed from udpmask in #5560 / v26.1.31) and the cert pin
+# predate this, but 26.3 covers the whole schema.
+HYSTERIA_MIN = (26, 3)
+
+_VER_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
+
+
+def parse_xray_version(text: str) -> Optional[tuple[int, int, int]]:
+    """Extract (major, minor, patch) from ``xray version`` output, or None."""
+    m = _VER_RE.search(text)
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+
+@lru_cache(maxsize=1)
+def xray_version() -> Optional[tuple[int, int, int]]:
+    """Return the installed xray's (major, minor, patch), or None if unknown.
+
+    Cached for the process — the binary doesn't change mid-run.
+    """
+    if not have("xray"):
+        return None
+    try:
+        r = subprocess.run(["xray", "version"],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return parse_xray_version(r.stdout + r.stderr)
 
 
 def _read_pid(p: Path) -> Optional[int]:

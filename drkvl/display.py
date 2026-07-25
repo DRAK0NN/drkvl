@@ -56,6 +56,8 @@ def status_lines(color: bool = False, indent: str = "") -> list[str]:
         up = time.time() - (started or time.time())
         lines.append(f"{indent}profile:   {_c('36', active.get('name', '?'), color)}")
         lines.append(f"{indent}server:    {active.get('host')}:{active.get('port')}")
+        if active.get("transport"):
+            lines.append(f"{indent}transport: {active['transport']}")
         lines.append(f"{indent}uptime:    {fmt_duration(up)}")
         if started:
             lines.append(f"{indent}started:   "

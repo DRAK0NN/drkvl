@@ -1,3 +1,5 @@
+import base64
+import binascii
 from dataclasses import dataclass, asdict
 from urllib.parse import urlparse, parse_qs, unquote
 
@@ -10,6 +12,7 @@ class Vless:
     host: str
     port: int
     name: str = ""
+    kind: str = "vless"           # profile-type discriminator (see link.from_dict)
 
     network: str = "tcp"          # tcp, ws, grpc, xhttp, httpupgrade
     security: str = "none"        # reality, tls, none
@@ -49,7 +52,7 @@ class Vless:
 def parse(uri: str) -> Vless:
     """Parse a ``vless://`` URI into a :class:`Vless`; raise ValueError if malformed."""
     s = uri.strip()
-    if not s.startswith("vless://"):
+    if not s.lower().startswith("vless://"):
         raise ValueError("not a vless link")
 
     u = urlparse(s)
@@ -106,3 +109,146 @@ def parse(uri: str) -> Vless:
         raw=s,
     )
     return v
+
+
+@dataclass
+class Hy2:
+    """A parsed ``hysteria2://`` link, emitted as an xray native hysteria outbound.
+
+    Kept separate from :class:`Vless` because hysteria's fields (auth, obfs,
+    cert pin, udp port-hopping) barely overlap; ``network``/``security`` are
+    fixed so ``list``/``status`` render it uniformly alongside vless profiles.
+    """
+
+    auth: str
+    host: str
+    port: int
+    name: str = ""
+    kind: str = "hy2"
+
+    network: str = "hysteria"     # constant; for uniform display with Vless
+    security: str = "tls"
+
+    sni: str = ""
+    insecure: bool = False        # accepted from the link; see cmd_add (allowInsecure
+                                  # was removed from xray — honoured only via pin)
+    pin_sha256: str = ""          # hex (colons ok) -> tlsSettings.pinnedPeerCertSha256
+
+    obfs: str = ""                # "" or "salamander"
+    obfs_password: str = ""
+
+    ports: str = ""               # udphop range, e.g. "20000-40000"
+    hop_interval: int = 0         # udphop interval (seconds); 0 = omit
+
+    raw: str = ""
+
+    def to_dict(self) -> dict:
+        """Return this link as a plain dict for JSON persistence."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Hy2":
+        """Build an Hy2 from a dict, ignoring unknown keys."""
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+Profile = Vless | Hy2
+
+
+def _norm_pin(pin: str) -> str:
+    """Normalise a pinSHA256 to the hex form xray's TLS layer accepts.
+
+    Verified against xray's ``TLSConfig.Build`` (infra/conf): each pin is
+    ``hex.DecodeString(ReplaceAll(v, ":", ""))`` and must be 32 bytes. So the
+    accepted form is a 64-char SHA-256 in HEX, case-insensitive, with optional
+    OpenSSL-style colons (``AA:BB:..``); base64 is NOT accepted. Hysteria links
+    carry the pin as colon-hex or base64, so we pass hex/colon-hex through
+    unchanged and decode a base64 pin to hex; anything else is left for xray to
+    reject.
+    """
+    pin = pin.strip()
+    if not pin:
+        return ""
+    stripped = pin.replace(":", "")
+    if stripped and all(c in "0123456789abcdefABCDEF" for c in stripped):
+        return pin
+    try:
+        raw = base64.b64decode(pin + "=" * (-len(pin) % 4))
+    except (binascii.Error, ValueError):
+        return pin
+    return raw.hex() if len(raw) == 32 else pin
+
+
+def parse_hy2(uri: str) -> Hy2:
+    """Parse a ``hysteria2://`` (or ``hy2://``) URI into an :class:`Hy2`.
+
+    Raises ValueError if malformed. ``auth`` is the full userinfo
+    (``user[:pass]``) or the ``?auth=`` query param.
+    """
+    s = uri.strip()
+    if not s.lower().startswith(("hysteria2://", "hy2://")):
+        raise ValueError("not a hysteria2 link")
+
+    u = urlparse(s)
+    if not u.hostname:
+        raise ValueError("missing host")
+    try:
+        port = u.port
+    except ValueError:
+        raise ValueError("invalid port (must be a number between 1 and 65535)")
+    if port is None:
+        raise ValueError("missing port")
+    if port < 1 or port > 65535:
+        raise ValueError(f"port {port} out of range 1-65535")
+
+    q = {k: v[0] for k, v in parse_qs(u.query, keep_blank_values=True).items()}
+
+    def g(k: str, d: str = "") -> str:
+        """Return query param ``k`` (already decoded), or default ``d``."""
+        val = q.get(k)
+        return val if val is not None else d
+
+    auth = ""
+    if u.username:
+        auth = unquote(u.username)
+        if u.password:
+            auth += ":" + unquote(u.password)
+    if not auth:
+        auth = g("auth")
+    if not auth:
+        raise ValueError("missing auth (password)")
+
+    interval = g("hopInterval")
+    return Hy2(
+        auth=auth,
+        host=u.hostname,
+        port=port,
+        name=unquote(u.fragment) if u.fragment else "",
+        sni=g("sni") or g("peer"),
+        insecure=g("insecure").lower() in ("1", "true", "yes"),
+        pin_sha256=_norm_pin(g("pinSHA256") or g("pinsha256")),
+        obfs=g("obfs"),
+        obfs_password=g("obfs-password") or g("obfs_password"),
+        ports=(g("mport") or g("ports")).strip(),
+        hop_interval=int(interval) if interval.isdigit() else 0,
+        raw=s,
+    )
+
+
+def parse_any(uri: str) -> Profile:
+    """Parse any supported proxy URI (``vless://`` or ``hysteria2://``).
+
+    Scheme matching is case-insensitive (RFC-3986 schemes are), matching the
+    subscription filter so an uppercase-scheme link is never misrouted.
+    """
+    s = uri.strip()
+    if s.lower().startswith(("hysteria2://", "hy2://")):
+        return parse_hy2(s)
+    return parse(s)
+
+
+def from_dict(d: dict) -> Profile:
+    """Reconstruct the right profile class from a persisted dict, keyed by ``kind``."""
+    if d.get("kind") == "hy2":
+        return Hy2.from_dict(d)
+    return Vless.from_dict(d)

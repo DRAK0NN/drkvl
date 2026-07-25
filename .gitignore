@@ -9,3 +9,4 @@ build/
 tools/
 *.log
 .venv/
+amnezia_merged.json

@@ -28,13 +28,64 @@ def _await_socks(port: int, attempts: int = 30, delay: float = 0.1) -> bool:
     return False
 
 
+def _profile_block_reason(v) -> "str | None":
+    """Why a profile cannot be connected on this host, or None (fail-closed).
+
+    Only hysteria profiles can be blocked: they need xray >= HYSTERIA_MIN, and
+    ``insecure=1`` without a cert pin can't work because xray removed
+    allowInsecure — the TLS handshake would just fail. Refusing up front beats a
+    silent dead tunnel.
+    """
+    if getattr(v, "kind", "") != "hy2":
+        return None
+    ver = proc.xray_version()
+    if ver and ver[:2] < proc.HYSTERIA_MIN:
+        lo = ".".join(map(str, proc.HYSTERIA_MIN))
+        return (f"hysteria outbound needs xray >= {lo}, but this xray is "
+                f"{ver[0]}.{ver[1]}.{ver[2]} — upgrade xray")
+    if v.insecure and not v.pin_sha256:
+        return ("insecure=1 without pinSHA256: this xray removed allowInsecure, "
+                "so TLS verification can't be skipped and the handshake would fail")
+    return None
+
+
+def _count_insecure_hy2(profiles) -> int:
+    """Count hysteria profiles with insecure=1 but no cert pin (unusable on connect)."""
+    return sum(1 for p in profiles
+               if getattr(p, "kind", "") == "hy2" and p.insecure and not p.pin_sha256)
+
+
+def _partition_testable(profiles):
+    """Split ``(name, v)`` profiles into (testable, blocked_error_rows).
+
+    Blocked profiles are turned into error :class:`speed.Result` rows (and a
+    warning) so they still show in the speed table instead of wasting a full
+    connect attempt that is guaranteed to fail.
+    """
+    testable, blocked = [], []
+    for name, v in profiles:
+        reason = _profile_block_reason(v)
+        if reason:
+            warn(f"skipping '{name}': {reason}")
+            blocked.append(speed.Result(name, v.host, v.port, None, "error"))
+        else:
+            testable.append((name, v))
+    return testable, blocked
+
+
 def cmd_add(a) -> int:
-    """Parse a vless:// URI and save it as a profile."""
+    """Parse a vless:// or hysteria2:// URI and save it as a profile."""
     try:
-        v = link.parse(a.uri)
+        v = link.parse_any(a.uri)
     except ValueError as e:
         err(str(e))
         return 1
+    if getattr(v, "kind", "") == "hy2":
+        if v.obfs and v.obfs != "salamander":
+            warn(f"unknown obfs '{v.obfs}'; only salamander is supported — ignoring it")
+        if 0 < v.hop_interval < config.HY_HOP_INTERVAL_MIN:
+            warn(f"hopInterval {v.hop_interval}s is below xray's {config.HY_HOP_INTERVAL_MIN}s "
+                 f"minimum — ignored; xray will use its 30s default")
     name = storage.save(v, a.name)
     info(f"saved profile '{name}' ({v.host}:{v.port}, {v.network}/{v.security})")
     return 0
@@ -80,19 +131,23 @@ def cmd_sub(a) -> int:
     except RuntimeError as e:
         err(str(e))
         return 1
-    vlesses, skipped = sub.parse_links(body)
-    if not vlesses:
-        err("no vless:// links found in subscription")
+    profiles, skipped = sub.parse_links(body)
+    if not profiles:
+        err("no supported links found in subscription (vless/hysteria2)")
         if skipped:
-            warn(f"{skipped} non-vless link(s) skipped")
+            warn(f"{skipped} unsupported link(s) skipped")
         return 1
     sub.remove_names(sub.url_profiles(a.url))   # re-subscribing replaces the old set
-    names = sub.add_profiles(vlesses)
+    names = sub.add_profiles(profiles)
     sub.set_url_profiles(a.url, names)
     msg = f"added {len(names)} profile(s) from subscription"
     if skipped:
-        msg += f" ({skipped} non-vless skipped)"
+        msg += f" ({skipped} unsupported skipped)"
     info(msg)
+    n_ins = _count_insecure_hy2(profiles)
+    if n_ins:
+        warn(f"{n_ins} hysteria profile(s) set insecure=1 without pinSHA256 — they'll be "
+             f"refused on connect (this xray removed allowInsecure); add pinSHA256 to use them")
     return 0
 
 
@@ -112,39 +167,45 @@ def cmd_sub_update(a) -> int:
             return 1
 
     total = 0
+    insecure_total = 0
     for url in urls:
         try:
             body = sub.fetch(url)
         except RuntimeError as e:
             err(f"{url}: {e} (keeping existing profiles)")
             continue
-        vlesses, skipped = sub.parse_links(body)
-        if not vlesses:
-            err(f"{url}: no vless links found (keeping existing profiles)")
+        profiles, skipped = sub.parse_links(body)
+        if not profiles:
+            err(f"{url}: no supported links found (keeping existing profiles)")
             continue
         sub.remove_names(sub.url_profiles(url))   # only after a good fetch
-        names = sub.add_profiles(vlesses)
+        names = sub.add_profiles(profiles)
         sub.set_url_profiles(url, names)
         total += len(names)
+        insecure_total += _count_insecure_hy2(profiles)
         line = f"{url}: {len(names)} profile(s)"
         if skipped:
             line += f" ({skipped} skipped)"
         info(line)
     info(f"updated {total} profile(s) from {len(urls)} subscription(s)")
+    if insecure_total:
+        warn(f"{insecure_total} hysteria profile(s) set insecure=1 without pinSHA256 — they'll "
+             f"be refused on connect (this xray removed allowInsecure); add pinSHA256 to use them")
     return 0
 
 
-def _save_active(name: str, v: link.Vless, stopped_clash: list[str]) -> None:
+def _save_active(name: str, v: link.Profile, stopped_clash: list[str]) -> None:
     state.write_active({
         "name": name,
         "host": v.host,
         "port": v.port,
+        "transport": f"{v.network}/{v.security}",
         "started": time.time(),
         "stopped_clash": stopped_clash,
     })
 
 
-def _attempt(name: str, v: link.Vless, bypass: bool, asset_dir, socks_wait: int):
+def _attempt(name: str, v: link.Profile, bypass: bool, asset_dir, socks_wait: int):
     """Start xray for one profile and wait for its socks port to open.
 
     Returns the resolved server IP on success, or None after warning and
@@ -212,8 +273,9 @@ def cmd_up(a) -> int:
         if not have("xray"):
             err("xray not found in PATH")
             return 1
-        info(f"speed-testing {len(profiles)} profile(s) in parallel...")
-        results = speed.run_tests(profiles)
+        testable, blocked = _partition_testable(profiles)
+        info(f"speed-testing {len(testable)} profile(s) in parallel...")
+        results = speed.sort_results(speed.run_tests(testable) + blocked)
         for line in display.speed_table(results, color=sys.stdout.isatty()):
             print(line)
         responded = [r for r in results if r.status == "ok"]
@@ -239,6 +301,23 @@ def cmd_up(a) -> int:
         except (FileNotFoundError, IndexError) as e:
             err(str(e))
             return 1
+    # fail-closed: refuse (single) or drop (fallback) profiles that can't connect
+    # here (old xray for hysteria, or hy2 insecure=1 without a pin).
+    usable = []
+    for name, v in candidates:
+        reason = _profile_block_reason(v)
+        if reason is None:
+            usable.append((name, v))
+        elif a.fallback:
+            warn(f"skipping '{name}': {reason}")
+        else:
+            err(f"cannot connect '{name}': {reason}")
+            return 1
+    if not usable:
+        err("no usable profile")
+        return 1
+    candidates = usable
+
     socks_wait = 30    # 3s for the real connect (winner already proven reachable)
 
     gw = tun.default_route() or {}
@@ -417,7 +496,7 @@ def cmd_bypass_clear(a) -> int:
     return 0
 
 
-def _full_test_one(name: str, v: link.Vless, bypass: bool, asset_dir) -> "speed.Result":
+def _full_test_one(name: str, v: link.Profile, bypass: bool, asset_dir) -> "speed.Result":
     """Bring the real TUN stack up for one profile, curl THROUGH the tun, tear down.
 
     Mirrors a real `up` (xray with fwmark -> tun2socks -> route swap) so the
@@ -487,12 +566,13 @@ def _speedtest_full(profiles) -> int:
         warn("hint: place geosite.dat/geoip.dat in ~/.config/drkvl/assets/")
         return 1
 
-    warn(f"full test: connecting each of {len(profiles)} profile(s) through the TUN, "
+    testable, blocked = _partition_testable(profiles)
+    warn(f"full test: connecting each of {len(testable)} profile(s) through the TUN, "
          f"one at a time — slow, and briefly disrupts your network")
     stopped_clash = clash.stop_active()
-    results = []
+    results = list(blocked)
     try:
-        for name, v in profiles:
+        for name, v in testable:
             info(f"testing '{name}' ({v.host}:{v.port})...")
             results.append(_full_test_one(name, v, True, asset_dir))
     finally:
@@ -500,7 +580,7 @@ def _speedtest_full(profiles) -> int:
         for f in (proc.TUN2SOCKS_PID, paths.BACKUP, paths.RESOLV_BAK):
             storage.clear(f)
 
-    for line in display.speed_table(results, color=sys.stdout.isatty()):
+    for line in display.speed_table(speed.sort_results(results), color=sys.stdout.isatty()):
         print(line)
     return 0
 
@@ -521,8 +601,9 @@ def cmd_speedtest(a) -> int:
         return 1
     if getattr(a, "full", False):
         return _speedtest_full(profiles)
-    info(f"speed-testing {len(profiles)} profile(s)...")
-    results = speed.run_tests(profiles)
+    testable, blocked = _partition_testable(profiles)
+    info(f"speed-testing {len(testable)} profile(s)...")
+    results = speed.sort_results(speed.run_tests(testable) + blocked)
     for line in display.speed_table(results, color=sys.stdout.isatty()):
         print(line)
     return 0
@@ -533,7 +614,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="drkvl", description="vless vpn client")
     sp = p.add_subparsers(dest="cmd", required=True)
 
-    a = sp.add_parser("add", help="add profile from vless:// link")
+    a = sp.add_parser("add", help="add profile from vless:// or hysteria2:// link")
     a.add_argument("uri")
     a.add_argument("-n", "--name", help="profile name")
     a.set_defaults(fn=cmd_add)

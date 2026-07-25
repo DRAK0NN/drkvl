@@ -5,8 +5,8 @@ import re
 from pathlib import Path
 from typing import Optional
 
-from . import ownership, paths
-from .link import Vless
+from . import link, ownership, paths
+from .link import Profile
 
 _safe = re.compile(r"[^a-zA-Z0-9._-]+")
 
@@ -64,15 +64,19 @@ def clear(p: Path) -> None:
         pass
 
 
-def list_all() -> list[tuple[str, Vless]]:
-    """Return ``(name, Vless)`` for every saved profile, skipping unreadable ones."""
+def list_all() -> list[tuple[str, Profile]]:
+    """Return ``(name, profile)`` for every saved profile, skipping unreadable ones.
+
+    Each profile reconstructs into the right class (Vless or Hy2) via
+    :func:`drkvl.link.from_dict`, keyed by its persisted ``kind``.
+    """
     if not paths.PROFILES.exists():
         return []
     out = []
     for p in sorted(paths.PROFILES.glob("*.json")):
         try:
             with open(p) as f:
-                out.append((p.stem, Vless.from_dict(json.load(f))))
+                out.append((p.stem, link.from_dict(json.load(f))))
         except Exception as e:
             from .util import warn
             warn(f"skipping unreadable profile {p.name}: {e}")
@@ -87,7 +91,7 @@ def count() -> int:
     return sum(1 for _ in paths.PROFILES.glob("*.json"))
 
 
-def save(v: Vless, name: Optional[str] = None) -> str:
+def save(v: Profile, name: Optional[str] = None) -> str:
     """Persist ``v`` to a uniquely-named profile file; return the stem used."""
     ownership.ensure_dirs()
     if not name:
@@ -111,8 +115,8 @@ def save(v: Vless, name: Optional[str] = None) -> str:
     return target.stem
 
 
-def load(name: Optional[str] = None) -> tuple[str, Vless]:
-    """Resolve ``name`` (or the default profile) to ``(name, Vless)``.
+def load(name: Optional[str] = None) -> tuple[str, Profile]:
+    """Resolve ``name`` (or the default profile) to ``(name, profile)``.
 
     ``name`` may be a profile name or a numeric index; an exact name match
     takes precedence so an all-digit profile name stays loadable.
