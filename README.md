@@ -17,7 +17,7 @@ VLESS VPN client for Linux. TUN mode — all system traffic through VPN.
 
                     author: DRAK0NN
 
-          v1.0.0  |  2 profiles  |  vpn: off
+          v2.0.0  |  2 profiles  |  vpn: off
 
   list, ls                            list profiles
   add <url> [-n name]                 add profile
