@@ -55,9 +55,18 @@ def parse(uri: str) -> Vless:
     if not s.lower().startswith("vless://"):
         raise ValueError("not a vless link")
 
-    u = urlparse(s)
-    if not u.username:
+    # peel userinfo ourselves before urlparse (see parse_hy2): a bare '/' in the
+    # identity is RFC-3986-illegal in userinfo, and urlparse then ends the
+    # authority at it so .port comes back None. UUIDs never contain '/', but a
+    # trojan-style secret in this position would, so hand only host:port on.
+    after = s.split("://", 1)[1]
+    after, _, frag = after.partition("#")
+    authority, _, query = after.partition("?")
+    userinfo, at, hostport = authority.rpartition("@")
+    if not at or not userinfo:
         raise ValueError("missing uuid")
+
+    u = urlparse("vless://" + hostport)
     if not u.hostname:
         raise ValueError("missing host")
     # urlparse defers port parsing until .port is accessed; a non-numeric
@@ -72,7 +81,7 @@ def parse(uri: str) -> Vless:
     if port < 1 or port > 65535:
         raise ValueError(f"port {port} out of range 1-65535")
 
-    q = {k: v[0] for k, v in parse_qs(u.query, keep_blank_values=True).items()}
+    q = {k: v[0] for k, v in parse_qs(query, keep_blank_values=True).items()}
 
     # parse_qs already percent-decodes values; do NOT unquote a second time.
     def g(k: str, d: str = "") -> str:
@@ -85,10 +94,10 @@ def parse(uri: str) -> Vless:
         net = "tcp"
 
     v = Vless(
-        uuid=unquote(u.username),
+        uuid=unquote(userinfo),
         host=u.hostname,
         port=port,
-        name=unquote(u.fragment) if u.fragment else "",
+        name=unquote(frag) if frag else "",
         network=net,
         security=g("security", "none") or "none",
         encryption=g("encryption", "none") or "none",
@@ -184,12 +193,29 @@ def parse_hy2(uri: str) -> Hy2:
 
     Raises ValueError if malformed. ``auth`` is the full userinfo
     (``user[:pass]``) or the ``?auth=`` query param.
+
+    Panels put a raw standard-base64 auth in the userinfo, and that alphabet
+    includes ``+``, ``/`` and ``=``. RFC-3986 forbids a bare ``/`` in userinfo
+    (it must be %2F-encoded), so urlparse ends the authority at that ``/`` — the
+    real ``host:port`` slides into ``.path`` and ``.port`` comes back None (or
+    raises, if the truncated authority holds a stray ``:``). So we peel the
+    userinfo off ourselves at the last ``@`` and hand only ``host:port`` to
+    urlparse. For the same reason ``auth`` / ``obfs-password`` are decoded with
+    ``unquote`` (``%XX`` decoded, a bare ``+`` kept literal as base64 data),
+    while all other params keep standard query semantics where ``+`` is a space.
     """
     s = uri.strip()
     if not s.lower().startswith(("hysteria2://", "hy2://")):
         raise ValueError("not a hysteria2 link")
 
-    u = urlparse(s)
+    # split by hand: base64 auth, host and port contain neither '#' nor '?',
+    # and the fragment is the last component, so these partitions are safe.
+    after = s.split("://", 1)[1]
+    after, _, frag = after.partition("#")
+    authority, _, query = after.partition("?")
+    userinfo, at, hostport = authority.rpartition("@")
+
+    u = urlparse("hysteria2://" + hostport)
     if not u.hostname:
         raise ValueError("missing host")
     try:
@@ -201,20 +227,29 @@ def parse_hy2(uri: str) -> Hy2:
     if port < 1 or port > 65535:
         raise ValueError(f"port {port} out of range 1-65535")
 
-    q = {k: v[0] for k, v in parse_qs(u.query, keep_blank_values=True).items()}
+    q = {k: v[0] for k, v in parse_qs(query, keep_blank_values=True).items()}
 
     def g(k: str, d: str = "") -> str:
-        """Return query param ``k`` (already decoded), or default ``d``."""
+        """Return query param ``k`` (parse_qs semantics: ``+`` -> space), or ``d``."""
         val = q.get(k)
         return val if val is not None else d
 
+    def gplus(k: str) -> str:
+        """Return raw query param ``k`` with a bare ``+`` kept literal (base64-safe)."""
+        for kv in query.split("&"):
+            key, eq, val = kv.partition("=")
+            if key == k:
+                return unquote(val)
+        return ""
+
+    # userinfo may be user:pass; unquote each half so a bare '+' in a base64
+    # secret survives (unquote_plus / parse_qs would turn it into a space).
     auth = ""
-    if u.username:
-        auth = unquote(u.username)
-        if u.password:
-            auth += ":" + unquote(u.password)
+    if at and userinfo:
+        user, colon, pw = userinfo.partition(":")
+        auth = unquote(user) + (":" + unquote(pw) if colon else "")
     if not auth:
-        auth = g("auth")
+        auth = gplus("auth")
     if not auth:
         raise ValueError("missing auth (password)")
 
@@ -223,12 +258,12 @@ def parse_hy2(uri: str) -> Hy2:
         auth=auth,
         host=u.hostname,
         port=port,
-        name=unquote(u.fragment) if u.fragment else "",
+        name=unquote(frag) if frag else "",
         sni=g("sni") or g("peer"),
         insecure=g("insecure").lower() in ("1", "true", "yes"),
         pin_sha256=_norm_pin(g("pinSHA256") or g("pinsha256")),
         obfs=g("obfs"),
-        obfs_password=g("obfs-password") or g("obfs_password"),
+        obfs_password=gplus("obfs-password") or gplus("obfs_password"),
         ports=(g("mport") or g("ports")).strip(),
         hop_interval=int(interval) if interval.isdigit() else 0,
         raw=s,

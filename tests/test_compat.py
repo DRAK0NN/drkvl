@@ -335,6 +335,15 @@ class TestLinkParser(unittest.TestCase):
         v = link.parse("vless://a%20b@h:443#enc")
         self.assertEqual(v.uuid, "a b")
 
+    def test_identity_with_slash(self):
+        # a '/' in the identity position (trojan-style secrets, not UUIDs) is
+        # RFC-3986-illegal in userinfo and used to truncate the authority ->
+        # must parse now instead of raising.
+        v = link.parse("vless://ab/cd@1.2.3.4:443#x")
+        self.assertEqual(v.uuid, "ab/cd")
+        self.assertEqual(v.host, "1.2.3.4")
+        self.assertEqual(v.port, 443)
+
     def test_encoded_fragment(self):
         v = link.parse("vless://uid@h:443#hello%20world")
         self.assertEqual(v.name, "hello world")

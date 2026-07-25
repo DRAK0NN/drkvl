@@ -107,6 +107,49 @@ class TestHy2Parser(unittest.TestCase):
         v2 = Hy2.from_dict(v.to_dict())
         self.assertEqual(v, v2)
 
+    def test_auth_base64_slash_plus_equals(self):
+        # panels put a raw standard-base64 auth in the userinfo; its alphabet
+        # includes '/', '+' and '='. A bare '/' is RFC-3986-illegal there and
+        # used to truncate the authority (host/port lost) -> must parse now.
+        auth = "BiVEY4KhwN/+HTxbepm41/YVNFNykbDP7g0sS2qJqMc="
+        v = link.parse_hy2(f"hysteria2://{auth}@185.0.0.1:20443?sni=s#n")
+        self.assertEqual(v.auth, auth)
+        self.assertEqual(v.host, "185.0.0.1")
+        self.assertEqual(v.port, 20443)
+
+    def test_auth_roundtrips_to_original_bytes(self):
+        # the auth must survive verbatim: decoding the parsed value yields the
+        # exact bytes the panel base64-encoded.
+        raw = bytes((6 + i * 31) % 256 for i in range(32))
+        auth = base64.b64encode(raw).decode()
+        self.assertIn("/", auth)
+        self.assertIn("+", auth)
+        v = link.parse_hy2(f"hysteria2://{auth}@h.example:443#n")
+        self.assertEqual(v.auth, auth)
+        self.assertEqual(base64.b64decode(v.auth), raw)
+
+    def test_obfs_password_bare_plus_preserved(self):
+        # a bare '+' in obfs-password is base64 data, not a space; keep it (and
+        # '/' / '='), while %XX still decodes (%2F -> /).
+        v = link.parse_hy2(
+            "hysteria2://pw@h:443?obfs=salamander&obfs-password=jd+gH/Mu%2Fx=")
+        self.assertEqual(v.obfs_password, "jd+gH/Mu/x=")
+
+    def test_obfs_password_percent_encoded_decodes(self):
+        # %2B is an explicit '+', %20 an explicit space -> both must decode
+        v = link.parse_hy2("hysteria2://pw@h:443?obfs-password=a%2Bb%20c")
+        self.assertEqual(v.obfs_password, "a+b c")
+
+    def test_auth_query_bare_plus_preserved(self):
+        v = link.parse_hy2("hysteria2://h:443?auth=a+b/c=&sni=s")
+        self.assertEqual(v.auth, "a+b/c=")
+
+    def test_plus_stays_space_for_other_params(self):
+        # plus-decoding is relaxed ONLY for auth/obfs-password; ordinary params
+        # keep standard query semantics ('+' -> space) so genuine spaces survive.
+        v = link.parse_hy2("hysteria2://pw@h:443?sni=a+b")
+        self.assertEqual(v.sni, "a b")
+
 
 # ---------------------------------------------------------------------------
 # 2. dispatchers: parse_any + from_dict
