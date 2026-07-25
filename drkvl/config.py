@@ -1,9 +1,37 @@
+import ipaddress
 import json
 import os
+from . import paths
 from .link import Vless, Profile
 
 SOCKS_PORT = 1080
 API_PORT = 10085
+
+# Default RU-domain resolver (Yandex), queried DIRECT (marked -> physical iface)
+# so RU sites get their in-country CDN answers. Must be a DISTINCT IP from the
+# tunnelled resolvers so routing can send only its queries to `direct`. This is
+# a deliberate anti-censorship choice (RU lookups leave via a Russian resolver);
+# override it with `drkvl ru-dns <ip>`. See :func:`ru_dns`.
+DNS_RU = "77.88.8.8"
+
+
+def ru_dns() -> str:
+    """Return the configured RU-domain resolver IP, or :data:`DNS_RU`.
+
+    Reads a single IPv4 literal from ``paths.RU_DNS`` (written by
+    ``drkvl ru-dns``); anything missing or non-IPv4 falls back to the default.
+    IPv4 only, because IPv6 egress is blocked while the tunnel is up.
+    """
+    try:
+        raw = paths.RU_DNS.read_text().strip()
+    except OSError:
+        return DNS_RU
+    try:
+        if ipaddress.ip_address(raw).version == 4:
+            return raw
+    except ValueError:
+        pass
+    return DNS_RU
 
 
 def _stream(v: Vless) -> dict:
@@ -196,18 +224,19 @@ def build(v: Profile, socks_port: int = SOCKS_PORT, api_port: int = API_PORT,
         # them to a side table whose default is the physical gw.
         direct["streamSettings"] = {"sockopt": {"mark": direct_mark}}
 
+    # dns-out only hijacks :53 into xray's built-in resolver; it carries NO mark.
+    # The resolver's own upstream queries are split by routing (see _routing):
+    # RU-domain lookups egress via `direct` (marked -> physical), everything else
+    # via `proxy` (inside the tunnel) — so non-RU DNS no longer leaks to 1.1.1.1
+    # in cleartext, and there is no dns-out -> drkvl0 loop (neither path uses the
+    # drkvl0 default route, which was the only reason dns-out used to be marked).
     dns_out: dict = {"tag": "dns-out", "protocol": "dns"}
-    if direct_mark:
-        # same as `direct`: without the mark, dns-out's queries to 1.1.1.1
-        # egress via the new drkvl0 default and loop back through socks-in.
-        dns_out["streamSettings"] = {"sockopt": {"mark": direct_mark}}
+
+    tunnel = bool(direct_mark)      # a real `up` (tun present) vs a speedtest config
 
     return {
         "log": {"loglevel": "warning"},
-        "dns": {
-            "servers": ["tcp://1.1.1.1", "tcp://8.8.8.8"],
-            "queryStrategy": "UseIPv4",
-        },
+        "dns": _dns(bypass, tunnel),
         "stats": {},
         "api": {"tag": "api", "services": ["StatsService"]},
         "policy": {
@@ -239,17 +268,50 @@ def build(v: Profile, socks_port: int = SOCKS_PORT, api_port: int = API_PORT,
             {"tag": "block", "protocol": "blackhole"},
             dns_out,
         ],
-        "routing": _routing(bypass, geo),
+        "routing": _routing(bypass, geo, tunnel),
     }
 
 
-def _routing(bypass: bool, geo: bool = True) -> dict:
+def _dns(bypass: bool, tunnel: bool) -> dict:
+    """Build the xray built-in resolver.
+
+    Without a tunnel (speedtest configs) this is the old, simple, fast local
+    resolver. With a tunnel, the resolver's upstream queries are ``tag``-ged
+    ``dns-in`` so :func:`_routing` can split them by outbound; with ``bypass``
+    a RU server (``DNS_RU``, routed direct) resolves RU domains in-country while
+    everything else uses 1.1.1.1/8.8.8.8 (routed through the proxy).
+    ``skipFallback`` keeps non-RU domains OFF the RU server (else they would
+    resolve direct and leak).
+    """
+    if not tunnel:
+        return {"queryStrategy": "UseIPv4",
+                "servers": ["tcp://1.1.1.1", "tcp://8.8.8.8"]}
+    servers: list = []
+    if bypass:
+        from . import bypass as _bypass
+        ru = ["geosite:category-ru"] + [f"domain:{d}" for d in _bypass.load_domains()]
+        servers.append({"address": ru_dns(), "domains": ru, "skipFallback": True})
+    servers += ["tcp://1.1.1.1", "tcp://8.8.8.8"]
+    return {"tag": "dns-in", "queryStrategy": "UseIPv4", "servers": servers}
+
+
+def _routing(bypass: bool, geo: bool = True, tunnel: bool = False) -> dict:
     rules: list[dict] = [
         {"type": "field", "inboundTag": ["api-in"], "outboundTag": "api"},
         {"type": "field", "inboundTag": ["socks-in"], "port": "53", "outboundTag": "dns-out"},
         {"type": "field", "port": "5355", "outboundTag": "block"},
         {"type": "field", "ip": ["fe80::/10"], "outboundTag": "block"},
     ]
+    if tunnel:
+        # split the resolver's OWN upstream queries (inboundTag dns-in): the RU
+        # resolver (DNS_RU) egresses `direct` (marked -> physical), everything
+        # else `proxy` (inside the tunnel). This closes the cleartext DNS leak
+        # while keeping RU domains resolved in-country. Neither branch touches
+        # the drkvl0 default route, so there is no dns-out -> tun loop.
+        if bypass:
+            rules.append({"type": "field", "inboundTag": ["dns-in"],
+                          "ip": [ru_dns()], "outboundTag": "direct"})
+        rules.append({"type": "field", "inboundTag": ["dns-in"], "outboundTag": "proxy"})
     if geo:
         # routing private/LAN traffic direct needs geoip.dat at parse time
         rules.append({"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"})

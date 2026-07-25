@@ -202,20 +202,55 @@ class TestConfigStatsFixes(unittest.TestCase):
         self.assertEqual(self._direct_rule(cfg, "geosite:category-ru"), ["geosite:category-ru"])
         self.assertEqual(self._direct_rule(cfg, "geoip:ru"), ["geoip:ru"])
 
-    # bug 2: dns-out must carry the direct fwmark so DNS egresses via the side
-    # table instead of looping back through the tun
+    # leak-A fix (supersedes the earlier bug-2 dns-out mark): marking dns-out
+    # sent ALL DNS to 1.1.1.1 in cleartext over the physical iface. dns-out is
+    # now unmarked and the resolver's upstream queries are split by routing:
+    # RU -> direct(marked), the rest -> proxy(tunnel). Verified against xray.
     def _dns_out(self, cfg):
         return [o for o in cfg["outbounds"] if o["tag"] == "dns-out"][0]
 
-    def test_dns_out_has_direct_mark(self):
-        cfg = config.build(Vless(uuid="u", host="h", port=443), direct_mark=0xDD0DE)
-        dns = self._dns_out(cfg)
-        self.assertEqual(dns.get("streamSettings", {}).get("sockopt", {}).get("mark"),
-                         0xDD0DE)
+    def _dns_in_rules(self, cfg):
+        return [r for r in cfg["routing"]["rules"] if r.get("inboundTag") == ["dns-in"]]
+
+    def test_dns_out_never_marked(self):
+        # even a full tunnel config must NOT mark dns-out (that was the leak)
+        cfg = config.build(Vless(uuid="u", host="h", port=443),
+                           direct_mark=0xDD0DE, mark=0xDD0DE)
+        self.assertNotIn("streamSettings", self._dns_out(cfg))
 
     def test_dns_out_no_mark_when_zero(self):
         cfg = config.build(Vless(uuid="u", host="h", port=443), direct_mark=0)
         self.assertNotIn("streamSettings", self._dns_out(cfg))
+
+    def test_split_dns_ru_direct_rest_proxy(self):
+        with mock.patch.object(bypass, "load_domains", return_value=[]):
+            cfg = config.build(Vless(uuid="u", host="h", port=443),
+                               direct_mark=0xDD0DE, mark=0xDD0DE, bypass=True)
+        rules = self._dns_in_rules(cfg)
+        self.assertEqual(rules[0]["ip"], [config.ru_dns()])     # RU resolver
+        self.assertEqual(rules[0]["outboundTag"], "direct")     #   -> direct (eno2)
+        self.assertEqual(rules[-1]["outboundTag"], "proxy")     # everything else
+        self.assertNotIn("ip", rules[-1])                       #   -> tunnel
+        servers = cfg["dns"]["servers"]
+        self.assertEqual(servers[0]["address"], config.ru_dns())
+        self.assertTrue(servers[0]["skipFallback"])             # non-RU skips RU server
+        self.assertEqual(cfg["dns"]["tag"], "dns-in")
+
+    def test_split_dns_no_bypass_all_proxy(self):
+        # --no-bypass with a tunnel: no RU split, ALL dns -> proxy (no leak)
+        cfg = config.build(Vless(uuid="u", host="h", port=443),
+                           direct_mark=0xDD0DE, mark=0xDD0DE, bypass=False)
+        rules = self._dns_in_rules(cfg)
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0]["outboundTag"], "proxy")
+        self.assertNotIn(config.ru_dns(), json.dumps(cfg["dns"]["servers"]))
+
+    def test_speedtest_dns_stays_local(self):
+        # no tunnel (direct_mark=0): simple local resolver, no dns-in split
+        cfg = config.build(Vless(uuid="u", host="h", port=443), bypass=False, geo=False)
+        self.assertNotIn("tag", cfg["dns"])
+        self.assertEqual(cfg["dns"]["servers"], ["tcp://1.1.1.1", "tcp://8.8.8.8"])
+        self.assertEqual(self._dns_in_rules(cfg), [])
 
     # bug 3: speed-test configs (bypass=False) must NOT load the custom bypass
     # lists (10k+ IPs) — that made every temp xray fail
@@ -598,6 +633,56 @@ class TestSetDefaultNameSafeWrite(unittest.TestCase):
         with self.assertRaises(OSError):
             state.set_default_name("x")
         self.assertEqual(victim.read_text(), "keep")
+
+
+# ---------------------------------------------------------------------------
+# configurable RU-domain resolver (drkvl ru-dns)
+# ---------------------------------------------------------------------------
+
+class TestRuDns(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self._save = paths.RU_DNS
+        paths.RU_DNS = Path(self._tmp) / "ru_dns"
+
+    def tearDown(self):
+        paths.RU_DNS = self._save
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_default_when_absent(self):
+        self.assertEqual(config.ru_dns(), config.DNS_RU)
+
+    def test_configured_ipv4(self):
+        paths.RU_DNS.write_text("8.8.4.4\n")
+        self.assertEqual(config.ru_dns(), "8.8.4.4")
+
+    def test_invalid_falls_back(self):
+        paths.RU_DNS.write_text("not-an-ip\n")
+        self.assertEqual(config.ru_dns(), config.DNS_RU)
+
+    def test_ipv6_falls_back(self):
+        # IPv6 egress is blocked while up, so an IPv6 RU resolver is rejected
+        paths.RU_DNS.write_text("2001:4860:4860::8888\n")
+        self.assertEqual(config.ru_dns(), config.DNS_RU)
+
+    def test_build_uses_configured_value(self):
+        paths.RU_DNS.write_text("8.8.4.4\n")
+        with mock.patch.object(bypass, "load_domains", return_value=[]):
+            cfg = config.build(Vless(uuid="u", host="h", port=443),
+                               direct_mark=0xDD0DE, mark=0xDD0DE, bypass=True)
+        self.assertEqual(cfg["dns"]["servers"][0]["address"], "8.8.4.4")
+        dnsin = [r for r in cfg["routing"]["rules"] if r.get("inboundTag") == ["dns-in"]]
+        self.assertEqual(dnsin[0]["ip"], ["8.8.4.4"])
+
+    def test_cmd_set_show_reset_and_reject_invalid(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO), \
+             mock.patch("sys.stderr", new_callable=io.StringIO):
+            self.assertEqual(cli.main(["ru-dns", "8.8.4.4"]), 0)
+            self.assertEqual(config.ru_dns(), "8.8.4.4")
+            self.assertEqual(cli.main(["ru-dns", "999.1.1.1"]), 1)   # invalid -> rc 1
+            self.assertEqual(config.ru_dns(), "8.8.4.4")             #   unchanged
+            self.assertEqual(cli.main(["ru-dns", "default"]), 0)     # reset
+            self.assertEqual(config.ru_dns(), config.DNS_RU)
 
 
 if __name__ == "__main__":

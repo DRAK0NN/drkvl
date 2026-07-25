@@ -155,6 +155,30 @@ round-trip through the proxy with curl, tears it down, and prints a table sorted
 by latency (`profile  server  port  latency  status`). `up --fallback` reuses the
 same test and connects to the fastest responder, falling back to the next if it fails.
 
+## dns
+
+DNS is split so lookups don't leak while RU sites still resolve correctly:
+
+- **RU domains** (`geosite:category-ru` + your imported bypass list) resolve via a
+  **Russian resolver** — default Yandex `77.88.8.8` — queried **directly** over the
+  physical link, so they get in-country CDN answers.
+- **everything else** resolves **through the tunnel** (1.1.1.1 / 8.8.8.8 reached
+  from the exit server), so those lookups never leave your machine in cleartext.
+
+Change the RU resolver:
+
+```sh
+drkvl ru-dns              # show current
+drkvl ru-dns 77.88.8.1    # set (IPv4 only, stored in ~/.config/drkvl/ru_dns)
+drkvl ru-dns default      # reset to Yandex 77.88.8.8
+```
+
+**Tradeoff:** a RU resolver returns correct CDN answers for RU sites, but that
+resolver — a Russian company by default — sees your RU queries (and they cross
+the physical link in cleartext). Point `ru-dns` at a resolver you trust; a
+non-RU one keeps RU queries away from a Russian company but may give less
+accurate RU CDN answers.
+
 ## vless link
 
 Supported `vless://` query params:
@@ -215,6 +239,8 @@ Congestion control is left at xray's default (BBR) — drkvl never emits a
 - TUN interface `drkvl0` uses `10.10.0.0/16`
 - DNS forced to `1.1.1.1` / `8.8.8.8`; original resolv.conf restored on down
 - IPv6 egress is blocked while connected and re-enabled on down
+- brief DNS window on connect: a few in-flight lookups can reach the LAN/uplink
+  resolver during the route swap, before DNS is steered into the tunnel
 - if anything breaks: `sudo drkvl emergency-off`
 
 ## layout

@@ -207,7 +207,8 @@ class TestTunSnapshot(unittest.TestCase):
         # shape of the persisted/returned snapshot
         self.assertEqual(
             set(snap),
-            {"default", "server_route", "resolv", "stopped_resolved", "server_ip"},
+            {"default", "server_route", "resolv", "stopped_resolved",
+             "server_ip", "dns_mode", "phys_link", "phys_default_route"},
         )
         self.assertEqual(snap["default"], default)
         self.assertEqual(snap["server_route"], srv_route)
@@ -220,6 +221,200 @@ class TestTunSnapshot(unittest.TestCase):
         args, _ = mock_write.call_args
         self.assertEqual(args[0], paths.BACKUP)
         self.assertEqual(args[1], snap)
+
+
+class DnsRun:
+    """tun._run stand-in for DNS tests: records argv; scripts rc for
+    `resolvectl dns` (drkvl0-not-yet-known race) and the `resolvectl status`
+    blob (physical-link default-route probe); else (0,'','')."""
+
+    def __init__(self, dns_rcs=None, status_out="     Default Route: yes\n",
+                 status_rc=0):
+        self.calls = []
+        self.dns_rcs = list(dns_rcs) if dns_rcs is not None else None
+        self.status_out = status_out
+        self.status_rc = status_rc
+
+    def __call__(self, cmd, check=False):
+        self.calls.append(list(cmd))
+        if cmd[:2] == ["resolvectl", "dns"] and self.dns_rcs is not None:
+            rc = self.dns_rcs.pop(0) if self.dns_rcs else 0
+            return (rc, "", "")
+        if cmd[:2] == ["resolvectl", "status"]:
+            return (self.status_rc, self.status_out, "")
+        return (0, "", "")
+
+
+class TestTunDns(unittest.TestCase):
+    """DNS strategy: resolvectl-steer (systemd-resolved) vs resolv.conf fallback."""
+
+    def _snap(self):
+        return {"default": {"dev": "eno2", "gateway": "192.168.1.1"},
+                "resolv": {"kind": "none"}, "stopped_resolved": False,
+                "dns_mode": "", "phys_link": "", "phys_default_route": None}
+
+    # --- apply_dns branch selection ---------------------------------------
+
+    def test_apply_dns_uses_resolvectl_when_available(self):
+        fake = DnsRun()
+        snap = self._snap()
+        with mock.patch.object(tun, "_run", fake), \
+             mock.patch.object(tun, "have", return_value=True), \
+             mock.patch.object(tun, "_resolved_active", return_value=True), \
+             mock.patch.object(tun, "_write_resolv") as wr, \
+             mock.patch.object(tun.subprocess, "run") as sp, \
+             mock.patch.object(tun.storage, "write_json"):
+            tun._apply_dns(snap)
+        self.assertEqual(snap["dns_mode"], "resolvectl")
+        wr.assert_not_called()                 # /etc/resolv.conf left alone
+        sp.assert_not_called()                 # resolved NOT stopped
+        self.assertIn(["resolvectl", "dns", tun.DEV, "1.1.1.1", "8.8.8.8"], fake.calls)
+        self.assertIn(["resolvectl", "domain", tun.DEV, "~."], fake.calls)
+        # physical link (eno2) default-route disabled + snapshotted (was yes -> True)
+        self.assertIn(["resolvectl", "default-route", "eno2", "false"], fake.calls)
+        self.assertEqual(snap["phys_link"], "eno2")
+        self.assertIs(snap["phys_default_route"], True)
+
+    def test_apply_dns_resolv_fallback_when_no_resolvectl(self):
+        fake = DnsRun()
+        snap = self._snap()
+        with mock.patch.object(tun, "_run", fake), \
+             mock.patch.object(tun, "have", return_value=False), \
+             mock.patch.object(tun, "_resolved_active", return_value=True), \
+             mock.patch.object(tun, "_write_resolv") as wr, \
+             mock.patch.object(tun.subprocess, "run") as sp, \
+             mock.patch.object(tun.storage, "write_json"):
+            tun._apply_dns(snap)
+        self.assertEqual(snap["dns_mode"], "resolv")
+        wr.assert_called_once()                # resolv.conf rewritten
+        self.assertTrue(snap["stopped_resolved"])
+        stops = [c for c in sp.call_args_list if c.args[0][:2] == ["systemctl", "stop"]]
+        self.assertEqual(len(stops), 1)        # resolved stopped
+        self.assertFalse(any(c[:2] == ["resolvectl", "dns"] for c in fake.calls))
+
+    def test_apply_dns_falls_back_when_resolvectl_never_ready(self):
+        snap = self._snap()
+        with mock.patch.object(tun, "_run", DnsRun()), \
+             mock.patch.object(tun, "have", return_value=True), \
+             mock.patch.object(tun, "_resolved_active", return_value=True), \
+             mock.patch.object(tun, "_setup_dns_resolvectl", return_value=False), \
+             mock.patch.object(tun, "_write_resolv") as wr, \
+             mock.patch.object(tun.subprocess, "run"), \
+             mock.patch.object(tun.storage, "write_json"):
+            tun._apply_dns(snap)
+        self.assertEqual(snap["dns_mode"], "resolv")
+        wr.assert_called_once()
+
+    # --- resolvectl setup retry (the drkvl0-visibility race) --------------
+
+    def test_setup_dns_resolvectl_retries_until_ready(self):
+        fake = DnsRun(dns_rcs=[1, 1, 0])       # link known on the 3rd attempt
+        with mock.patch.object(tun, "_run", fake):
+            ok = tun._setup_dns_resolvectl(retries=5, delay=0)
+        self.assertTrue(ok)
+        self.assertEqual(len([c for c in fake.calls if c[:2] == ["resolvectl", "dns"]]), 3)
+        self.assertIn(["resolvectl", "domain", tun.DEV, "~."], fake.calls)
+
+    def test_setup_dns_resolvectl_gives_up_after_retries(self):
+        fake = DnsRun(dns_rcs=[1, 1, 1])
+        with mock.patch.object(tun, "_run", fake):
+            ok = tun._setup_dns_resolvectl(retries=3, delay=0)
+        self.assertFalse(ok)
+        self.assertFalse(any(c[:2] == ["resolvectl", "domain"] for c in fake.calls))
+
+    # --- teardown mirrors the mode ----------------------------------------
+
+    def test_teardown_dns_resolvectl_reverts_link_only(self):
+        fake = DnsRun()
+        with mock.patch.object(tun, "_run", fake), \
+             mock.patch.object(tun.subprocess, "run") as sp, \
+             mock.patch.object(tun, "_restore_resolv") as rr:
+            tun._teardown_dns({"dns_mode": "resolvectl"})
+        self.assertIn(["resolvectl", "revert", tun.DEV], fake.calls)
+        sp.assert_not_called()                 # resolved never restarted
+        rr.assert_not_called()                 # resolv.conf never restored
+
+    def test_teardown_dns_resolv_restarts_and_restores(self):
+        fake = DnsRun()
+        with mock.patch.object(tun, "_run", fake), \
+             mock.patch.object(tun.subprocess, "run",
+                               return_value=mock.Mock(returncode=0, stderr="")) as sp, \
+             mock.patch.object(tun, "_restore_resolv") as rr:
+            tun._teardown_dns({"dns_mode": "resolv", "stopped_resolved": True,
+                               "resolv": {"kind": "none"}})
+        starts = [c for c in sp.call_args_list if c.args[0][:2] == ["systemctl", "start"]]
+        self.assertEqual(len(starts), 1)
+        rr.assert_called_once()
+        self.assertNotIn(["resolvectl", "revert", tun.DEV], fake.calls)
+
+    def test_teardown_dns_legacy_snapshot_without_mode(self):
+        # a snapshot persisted before this change has no dns_mode -> resolv path
+        with mock.patch.object(tun, "_run", DnsRun()), \
+             mock.patch.object(tun.subprocess, "run",
+                               return_value=mock.Mock(returncode=0, stderr="")), \
+             mock.patch.object(tun, "_restore_resolv") as rr:
+            tun._teardown_dns({"stopped_resolved": False, "resolv": {"kind": "none"}})
+        rr.assert_called_once()
+
+    # --- physical-link DNS-leak fix (resolvectl default-route) -------------
+
+    def test_link_default_route_parsing(self):
+        with mock.patch.object(tun, "_run", DnsRun(status_out="  Default Route: yes\n")):
+            self.assertIs(tun._link_default_route("eno2"), True)
+        with mock.patch.object(tun, "_run", DnsRun(status_out="  Default Route: no\n")):
+            self.assertIs(tun._link_default_route("eno2"), False)
+        with mock.patch.object(tun, "_run",
+                               DnsRun(status_out="Link 2 (eno2)\n  DNS Servers: 1.1.1.1\n")):
+            self.assertIsNone(tun._link_default_route("eno2"))   # flag not shown
+        with mock.patch.object(tun, "_run", DnsRun(status_rc=1)):
+            self.assertIsNone(tun._link_default_route("eno2"))   # link unknown
+
+    def test_steer_phys_skipped_when_value_unreadable(self):
+        # can't read the phys link's flag -> don't toggle it, don't record it
+        snap = self._snap()
+        with mock.patch.object(tun, "_run", DnsRun(status_rc=1)) as fake, \
+             mock.patch.object(tun, "have", return_value=True), \
+             mock.patch.object(tun, "_resolved_active", return_value=True), \
+             mock.patch.object(tun, "_write_resolv"), \
+             mock.patch.object(tun.subprocess, "run"), \
+             mock.patch.object(tun.storage, "write_json"):
+            tun._apply_dns(snap)
+        self.assertEqual(snap["dns_mode"], "resolvectl")
+        self.assertEqual(snap["phys_link"], "")
+        self.assertIsNone(snap["phys_default_route"])
+        self.assertFalse(any(c[:2] == ["resolvectl", "default-route"] for c in fake.calls))
+
+    def test_teardown_restores_phys_true(self):
+        fake = DnsRun()
+        with mock.patch.object(tun, "_run", fake), \
+             mock.patch.object(tun.subprocess, "run") as sp, \
+             mock.patch.object(tun, "_restore_resolv") as rr:
+            tun._teardown_dns({"dns_mode": "resolvectl", "phys_link": "eno2",
+                               "phys_default_route": True})
+        self.assertIn(["resolvectl", "default-route", "eno2", "true"], fake.calls)
+        self.assertIn(["resolvectl", "revert", tun.DEV], fake.calls)
+        sp.assert_not_called()
+        rr.assert_not_called()
+
+    def test_teardown_restores_phys_false(self):
+        # do NOT assume it was true: a snapshotted False must come back as false
+        fake = DnsRun()
+        with mock.patch.object(tun, "_run", fake), \
+             mock.patch.object(tun.subprocess, "run"), \
+             mock.patch.object(tun, "_restore_resolv"):
+            tun._teardown_dns({"dns_mode": "resolvectl", "phys_link": "eno2",
+                               "phys_default_route": False})
+        self.assertIn(["resolvectl", "default-route", "eno2", "false"], fake.calls)
+
+    def test_teardown_no_phys_toggle_when_unrecorded(self):
+        # resolvectl mode but phys was never touched (unreadable on up) -> no toggle
+        fake = DnsRun()
+        with mock.patch.object(tun, "_run", fake), \
+             mock.patch.object(tun.subprocess, "run"), \
+             mock.patch.object(tun, "_restore_resolv"):
+            tun._teardown_dns({"dns_mode": "resolvectl"})
+        self.assertFalse(any(c[:2] == ["resolvectl", "default-route"] for c in fake.calls))
+        self.assertIn(["resolvectl", "revert", tun.DEV], fake.calls)
 
 
 if __name__ == "__main__":
