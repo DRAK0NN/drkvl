@@ -1,4 +1,5 @@
 import argparse
+import ipaddress
 import os
 import sys
 import time
@@ -417,6 +418,33 @@ def cmd_bypass_clear(a) -> int:
     return 0
 
 
+def cmd_ru_dns(a) -> int:
+    """Show or set the resolver used for RU-domain lookups (resolved direct).
+
+    RU domains are resolved via this IP over the physical link (not the tunnel)
+    so they get in-country CDN answers — at the cost of that resolver seeing
+    your RU queries. Default is Yandex (config.DNS_RU).
+    """
+    if not a.ip:
+        cur = config.ru_dns()
+        tag = " (default)" if cur == config.DNS_RU else ""
+        info(f"ru-dns: {cur}{tag}")
+        return 0
+    if a.ip == "default":
+        storage.clear(paths.RU_DNS)
+        info(f"ru-dns reset to default ({config.DNS_RU})")
+        return 0
+    try:
+        if ipaddress.ip_address(a.ip).version != 4:
+            raise ValueError
+    except ValueError:
+        err(f"not a valid IPv4 address: {a.ip} (IPv6 egress is blocked while up)")
+        return 1
+    storage.write_text(paths.RU_DNS, a.ip + "\n")
+    info(f"ru-dns set to {a.ip}")
+    return 0
+
+
 def _full_test_one(name: str, v: link.Vless, bypass: bool, asset_dir) -> "speed.Result":
     """Bring the real TUN stack up for one profile, curl THROUGH the tun, tear down.
 
@@ -593,6 +621,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     a = sp.add_parser("bypass-clear", help="remove custom bypass lists")
     a.set_defaults(fn=cmd_bypass_clear)
+
+    a = sp.add_parser("ru-dns", help="show/set the RU-domain resolver IP")
+    a.add_argument("ip", nargs="?",
+                   help="IPv4 to use, or 'default' to reset; omit to show current")
+    a.set_defaults(fn=cmd_ru_dns)
 
     return p
 

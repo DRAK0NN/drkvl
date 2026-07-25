@@ -34,3 +34,4 @@ DEFAULT = HOME / "default"
 SUBSCRIPTIONS = HOME / "subscriptions.json"
 BYPASS_DOMAINS = HOME / "bypass_domains.txt"
 BYPASS_IPS = HOME / "bypass_ips.txt"
+RU_DNS = HOME / "ru_dns"          # override IP for the RU-domain resolver

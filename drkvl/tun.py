@@ -17,6 +17,9 @@ class Snapshot(TypedDict):
     resolv: dict
     stopped_resolved: bool
     server_ip: str
+    dns_mode: str          # "resolvectl" | "resolv" — how down() reverts DNS
+    phys_link: str         # physical iface whose resolved default-route we toggled
+    phys_default_route: Optional[bool]   # its pre-up value, restored verbatim on down
 
 DEV = "drkvl0"
 TUN_ADDR = "10.10.0.1"
@@ -189,6 +192,132 @@ def _resolved_active() -> bool:
         capture_output=True).returncode == 0
 
 
+# public DNS the tunnel forwards to (xray routes socks-in :53 -> dns-out).
+DNS_SERVERS = ["1.1.1.1", "8.8.8.8"]
+
+
+def _resolvectl_available() -> bool:
+    """True when DNS can be steered via systemd-resolved instead of resolv.conf."""
+    return have("resolvectl") and _resolved_active()
+
+
+def _setup_dns_resolvectl(retries: int = 20, delay: float = 0.1) -> bool:
+    """Point systemd-resolved's DNS at the tun link; return success.
+
+    Retries because drkvl0 is a raw tun that resolved registers
+    asynchronously: `resolvectl dns drkvl0 ...` fails until resolved has seen
+    the link (the race the caller must tolerate). The `~.` routing domain makes
+    drkvl0 the catch-all, so every query goes 1.1.1.1 -> drkvl0 -> tun2socks ->
+    xray dns-out. Both undo themselves when the link is deleted on `down`.
+    """
+    for _ in range(retries):
+        rc, _, _ = _run(["resolvectl", "dns", DEV, *DNS_SERVERS])
+        if rc == 0:
+            _run(["resolvectl", "domain", DEV, "~."])
+            return True
+        time.sleep(delay)
+    return False
+
+
+def _link_default_route(iface: str) -> Optional[bool]:
+    """Read resolved's per-link 'Default Route' flag for ``iface``.
+
+    Parsed from ``resolvectl status <iface>``; returns True/False, or None if
+    the link is unknown to resolved or the flag isn't shown (then we leave it
+    untouched rather than guess).
+    """
+    rc, out, _ = _run(["resolvectl", "status", iface])
+    if rc != 0:
+        return None
+    for line in out.splitlines():
+        s = line.strip()
+        if s.startswith("Default Route:"):
+            val = s.split(":", 1)[1].strip().lower()
+            if val in ("yes", "true"):
+                return True
+            if val in ("no", "false"):
+                return False
+    return None
+
+
+def _steer_phys_off(snap: Snapshot) -> None:
+    """Stop resolved querying the physical link outside the tunnel (a DNS leak).
+
+    In resolvectl mode resolved keeps the physical iface's DNS scope with
+    Default Route=yes, so it races the LAN/ISP resolver against drkvl0 and can
+    leak queries off-tunnel. Snapshot the current value (do NOT assume it was
+    true) and disable it; :func:`_restore_phys` puts the snapshotted value back
+    on down. No-op if the value can't be read (link unknown to resolved).
+    """
+    phys = (snap.get("default") or {}).get("dev")
+    if not phys:
+        return
+    prev = _link_default_route(phys)
+    if prev is None:
+        return
+    snap["phys_link"] = phys
+    snap["phys_default_route"] = prev
+    info(f"disabling resolved default-route on {phys} (was {prev}) — stops DNS leak")
+    _run(["resolvectl", "default-route", phys, "false"])
+
+
+def _restore_phys(snap: dict) -> None:
+    """Restore the physical link's resolved Default Route to its snapshotted value."""
+    phys = snap.get("phys_link")
+    prev = snap.get("phys_default_route")
+    if phys and prev is not None:
+        _run(["resolvectl", "default-route", phys, "true" if prev else "false"])
+
+
+def _apply_dns(snap: Snapshot) -> None:
+    """Set up session DNS, recording the mode so `down` can revert it.
+
+    Preferred (systemd-resolved present): steer resolved at drkvl0 via
+    resolvectl and leave /etc/resolv.conf untouched. This keeps nss-resolve
+    resolving through the tunnel — on systems whose nsswitch has
+    ``resolve [!UNAVAIL=return] ... dns``, stopping resolved and rewriting
+    resolv.conf doesn't help, because a revived/answering resolved
+    short-circuits NSS before the `dns` branch is ever consulted. Fallback (no
+    resolved, or resolvectl racing): rewrite resolv.conf and stop resolved.
+    """
+    if _resolvectl_available():
+        info(f"steering systemd-resolved DNS at {DEV} (resolvectl)")
+        if _setup_dns_resolvectl():
+            _steer_phys_off(snap)          # after drkvl0 is configured
+            snap["dns_mode"] = "resolvectl"
+            storage.write_json(paths.BACKUP, snap)
+            return
+        warn(f"resolvectl did not accept {DEV} in time; falling back to resolv.conf")
+
+    info("writing /etc/resolv.conf")
+    _write_resolv(DEFAULT_DNS)
+    snap["dns_mode"] = "resolv"
+    if _resolved_active():
+        info("stopping systemd-resolved (so nss falls through to the dns branch)")
+        subprocess.run(["systemctl", "stop", "systemd-resolved"], check=False)
+        snap["stopped_resolved"] = True
+    storage.write_json(paths.BACKUP, snap)
+
+
+def _teardown_dns(snap: Optional[Snapshot]) -> None:
+    """Undo :func:`_apply_dns` based on the recorded ``dns_mode``."""
+    snap = snap or {}
+    if snap.get("dns_mode") == "resolvectl":
+        # restore the physical link's default-route to its snapshotted value
+        # first (covers both `down` and up-failure rollback), then drop drkvl0's
+        # per-link DNS (which also goes with the link when it's deleted).
+        _restore_phys(snap)
+        _run(["resolvectl", "revert", DEV])
+        return
+    # legacy/fallback path: restart resolved if we stopped it, restore resolv.conf
+    if snap.get("stopped_resolved"):
+        r = subprocess.run(["systemctl", "start", "systemd-resolved"],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            warn(f"could not restart systemd-resolved: {r.stderr.strip()}")
+    _restore_resolv(snap.get("resolv"))
+
+
 def snapshot(server_ip: str) -> Snapshot:
     """Capture and persist the current routing/DNS state before bringing up the tun."""
     snap: Snapshot = {
@@ -197,6 +326,9 @@ def snapshot(server_ip: str) -> Snapshot:
         "resolv": _backup_resolv(),
         "stopped_resolved": False,
         "server_ip": server_ip,
+        "dns_mode": "",
+        "phys_link": "",
+        "phys_default_route": None,
     }
     storage.write_json(paths.BACKUP, snap)
     return snap
@@ -405,14 +537,7 @@ def apply_up(server_ip: str, socks_port: int) -> Snapshot:
     info("blocking IPv6 egress (tun2socks is IPv4-only)")
     block_ipv6()
 
-    info("writing /etc/resolv.conf")
-    _write_resolv(DEFAULT_DNS)
-
-    if _resolved_active():
-        info("stopping systemd-resolved (avoid LLMNR flood)")
-        subprocess.run(["systemctl", "stop", "systemd-resolved"], check=False)
-        snap["stopped_resolved"] = True
-        storage.write_json(paths.BACKUP, snap)
+    _apply_dns(snap)
 
     _dump_routing("up_ok")
     return snap
@@ -442,15 +567,7 @@ def apply_down(snap: Optional[Snapshot]) -> None:
             if not default_route():
                 ip("route", "add", "default", "via", gw["gateway"], "dev", gw["dev"], check=False)
 
-    # only restart systemd-resolved if WE stopped it (don't start a service
-    # the user had disabled/masked before `up`).
-    if snap and snap.get("stopped_resolved"):
-        r = subprocess.run(["systemctl", "start", "systemd-resolved"],
-                           capture_output=True, text=True)
-        if r.returncode != 0:
-            warn(f"could not restart systemd-resolved: {r.stderr.strip()}")
-
-    _restore_resolv((snap or {}).get("resolv"))
+    _teardown_dns(snap)
 
 
 def emergency() -> None:

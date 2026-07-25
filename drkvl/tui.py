@@ -83,6 +83,7 @@ _CMD_HELP = [
     ("bypass-import <file>", "import Amnezia bypass list"),
     ("bypass-list", "show custom bypass stats"),
     ("bypass-clear", "clear custom bypass list"),
+    ("ru-dns [ip]", "show/set RU-domain resolver"),
     ("rm <name|index>", "remove profile"),
     ("default <name|index>", "set default"),
     ("emergency-off", "hard stop + clean"),
@@ -138,7 +139,7 @@ def _do_stats():
 
 _CMDS = ["list", "ls", "add", "sub", "sub-update", "up", "down", "status",
          "st", "stats", "speedtest", "bypass-import", "bypass-list",
-         "bypass-clear", "rm", "default", "emergency-off", "help",
+         "bypass-clear", "ru-dns", "rm", "default", "emergency-off", "help",
          "exit", "quit", "q"]
 
 
@@ -205,6 +206,8 @@ def run() -> int:
             _dispatch(["bypass-list"])
         elif cmd == "bypass-clear":
             _dispatch(["bypass-clear"])
+        elif cmd == "ru-dns":
+            _dispatch(["ru-dns"] + args)
         elif cmd == "add":
             if not args:
                 _err("usage: add <vless://...> [-n name]")
