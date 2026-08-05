@@ -685,5 +685,34 @@ class TestRuDns(unittest.TestCase):
             self.assertEqual(config.ru_dns(), config.DNS_RU)
 
 
+class TestServerHostsPin(unittest.TestCase):
+    """Pin the vless server's own domain to its resolved IP in dns.hosts.
+
+    Without this, resolving the server's domain requires the `proxy`
+    outbound, which requires the server's domain to already be resolved —
+    a deadlock (drkvena.ddns.net repro).
+    """
+
+    def test_build_pins_domain_host_when_server_ip_given(self):
+        with mock.patch.object(bypass, "load_domains", return_value=[]):
+            cfg = config.build(Vless(uuid="u", host="drkvena.ddns.net", port=443),
+                               direct_mark=0xDD0DE, mark=0xDD0DE, bypass=True,
+                               server_ip="45.155.71.175")
+        self.assertEqual(cfg["dns"]["hosts"], {"drkvena.ddns.net": ["45.155.71.175"]})
+
+    def test_build_skips_pin_when_host_already_an_ip(self):
+        with mock.patch.object(bypass, "load_domains", return_value=[]):
+            cfg = config.build(Vless(uuid="u", host="193.233.161.203", port=443),
+                               direct_mark=0xDD0DE, mark=0xDD0DE, bypass=True,
+                               server_ip="193.233.161.203")
+        self.assertNotIn("hosts", cfg["dns"])
+
+    def test_build_no_hosts_key_when_server_ip_omitted(self):
+        with mock.patch.object(bypass, "load_domains", return_value=[]):
+            cfg = config.build(Vless(uuid="u", host="drkvena.ddns.net", port=443),
+                               direct_mark=0xDD0DE, mark=0xDD0DE, bypass=True)
+        self.assertNotIn("hosts", cfg["dns"])
+
+
 if __name__ == "__main__":
     unittest.main()

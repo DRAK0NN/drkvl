@@ -307,6 +307,40 @@ class TestFullTest(unittest.TestCase):
         stopx.assert_called()
         adown.assert_called()
 
+    def test_full_passes_resolved_server_ip_to_config_build(self):
+        # so xray's dns.hosts can pin the server's domain — resolving it
+        # would otherwise require the `proxy` outbound it's dialing (deadlock).
+        with mock.patch.object(cli, "resolve_host", return_value="9.9.9.9"), \
+             mock.patch.object(cli.config, "build", return_value={}) as build, \
+             mock.patch.object(cli.config, "dump"), \
+             mock.patch.object(cli.ownership, "ensure_dirs"), \
+             mock.patch.object(cli.ownership, "chown_user"), \
+             mock.patch.object(cli.proc, "start_xray"), \
+             mock.patch.object(cli.proc, "stop_xray"), \
+             mock.patch.object(cli, "_await_socks", return_value=True), \
+             mock.patch.object(cli.tun, "apply_up"), \
+             mock.patch.object(cli.tun, "apply_down"), \
+             mock.patch.object(cli.tun, "load_snapshot", return_value={}), \
+             mock.patch.object(cli.speed, "curl_direct", return_value=("ok", 42.0)):
+            cli._full_test_one("p", V, True, None)
+        self.assertEqual(build.call_args.kwargs.get("server_ip"), "9.9.9.9")
+
+
+class TestAttemptServerIpWiring(unittest.TestCase):
+    def test_attempt_passes_resolved_server_ip_to_config_build(self):
+        # same deadlock as _full_test_one: `up`'s real xray also dials the
+        # server domain through `proxy`, so it needs the dns.hosts pin too.
+        with mock.patch.object(cli, "resolve_host", return_value="9.9.9.9"), \
+             mock.patch.object(cli.config, "build", return_value={}) as build, \
+             mock.patch.object(cli.config, "dump"), \
+             mock.patch.object(cli.ownership, "ensure_dirs"), \
+             mock.patch.object(cli.ownership, "chown_user"), \
+             mock.patch.object(cli.proc, "start_xray"), \
+             mock.patch.object(cli, "_await_socks", return_value=True):
+            r = cli._attempt("p", V, True, None, 30)
+        self.assertEqual(r, "9.9.9.9")
+        self.assertEqual(build.call_args.kwargs.get("server_ip"), "9.9.9.9")
+
     def test_speedtest_full_requires_root(self):
         args = types.SimpleNamespace(full=True)
         with mock.patch.object(cli.storage, "list_all", return_value=[("a", V)]), \

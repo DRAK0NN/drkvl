@@ -206,13 +206,20 @@ def _hysteria_outbound(v: Profile, mark: int) -> dict:
 
 def build(v: Profile, socks_port: int = SOCKS_PORT, api_port: int = API_PORT,
           mark: int = 0, bypass: bool = True, direct_mark: int = 0,
-          geo: bool = True) -> dict:
+          geo: bool = True, server_ip: str = "") -> dict:
     """Build the full xray config dict for ``v`` (socks inbound, routing, marks).
 
     ``v`` may be a :class:`~drkvl.link.Vless` or :class:`~drkvl.link.Hy2`; only
     the ``proxy`` outbound differs, everything else (routing, dns, marks) is
     engine-agnostic. ``geo=False`` drops all geoip/geosite routing rules so the
     config needs no .dat assets — used for throwaway speed-test xrays.
+
+    ``server_ip``, when given and ``v.host`` is a domain (not already an IP
+    literal), pins that domain to it in ``dns.hosts``. Without this, resolving
+    the server's own domain requires the ``proxy`` outbound — but ``proxy``
+    can't connect until the server's domain is resolved. A deadlock. The
+    caller resolves ``v.host`` once, before the tunnel swaps the default
+    route, when plain OS resolution still works.
     """
     proxy_ob = _proxy_outbound(v, mark)
 
@@ -234,9 +241,16 @@ def build(v: Profile, socks_port: int = SOCKS_PORT, api_port: int = API_PORT,
 
     tunnel = bool(direct_mark)      # a real `up` (tun present) vs a speedtest config
 
+    dns_cfg = _dns(bypass, tunnel)
+    if server_ip:
+        try:
+            ipaddress.ip_address(v.host)
+        except ValueError:
+            dns_cfg["hosts"] = {v.host: [server_ip]}
+
     return {
         "log": {"loglevel": "warning"},
-        "dns": _dns(bypass, tunnel),
+        "dns": dns_cfg,
         "stats": {},
         "api": {"tag": "api", "services": ["StatsService"]},
         "policy": {

@@ -218,7 +218,7 @@ def _attempt(name: str, v: link.Profile, bypass: bool, asset_dir, socks_wait: in
         warn(f"{name}: {e}")
         return None
     cfg = config.build(v, bypass=bypass, direct_mark=tun.DIRECT_FWMARK,
-                       mark=tun.DIRECT_FWMARK)
+                       mark=tun.DIRECT_FWMARK, server_ip=server_ip)
     ownership.ensure_dirs()
     config.dump(cfg, paths.XRAY_CONFIG)
     ownership.chown_user(paths.XRAY_CONFIG)
@@ -536,7 +536,7 @@ def _full_test_one(name: str, v: link.Profile, bypass: bool, asset_dir) -> "spee
         warn(f"{name}: {e}")
         return speed.Result(name, v.host, v.port, None, "error")
     cfg = config.build(v, bypass=bypass, direct_mark=tun.DIRECT_FWMARK,
-                       mark=tun.DIRECT_FWMARK)
+                       mark=tun.DIRECT_FWMARK, server_ip=server_ip)
     ownership.ensure_dirs()
     config.dump(cfg, paths.XRAY_CONFIG)
     ownership.chown_user(paths.XRAY_CONFIG)
